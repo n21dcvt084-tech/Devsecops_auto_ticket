@@ -1,0 +1,224 @@
+import logging
+from urllib.parse import urljoin
+
+import requests
+
+from config import Settings
+from schemas import DefectDojoFinding
+
+logger = logging.getLogger(__name__)
+
+
+class DefectDojoClient:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self._test_cache: dict[int, dict] = {}
+        self._engagement_cache: dict[int, dict] = {}
+        self._product_cache: dict[int, dict] = {}
+
+    def fetch_active_verified_findings(self) -> list[DefectDojoFinding]:
+        findings: list[DefectDojoFinding] = []
+        limit = self.settings.defectdojo_findings_limit
+        offset = 0
+        next_url: str | None = self._findings_url()
+
+        while next_url:
+            logger.info("DefectDojo API call started")
+            response = requests.get(
+                next_url,
+                headers=self._headers(),
+                params=(
+                    {
+                        "active": "true",
+                        "verified": "true",
+                        "limit": limit,
+                        "offset": offset,
+                    }
+                    if "?" not in next_url
+                    else None
+                ),
+                timeout=self.settings.defectdojo_request_timeout_seconds,
+            )
+            response.raise_for_status()
+            payload = response.json()
+
+            for raw_finding in payload.get("results", []):
+                finding = self._map_finding(raw_finding)
+                findings.append(finding)
+                logger.info(
+                    "Finding fetched",
+                    extra={
+                        "finding_id": finding.finding_id,
+                        "product": finding.product,
+                        "severity": finding.severity,
+                    },
+                )
+
+            next_url = payload.get("next")
+            if next_url:
+                continue
+
+            count = payload.get("count")
+            offset += limit
+            if count is not None and offset < int(count):
+                next_url = self._findings_url()
+            else:
+                next_url = None
+
+        return findings
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Token {self.settings.defectdojo_api_token}",
+            "Accept": "application/json",
+        }
+
+    def _findings_url(self) -> str:
+        return urljoin(self.settings.defectdojo_base_url + "/", "api/v2/findings/")
+
+    def _api_url(self, path: str) -> str:
+        return urljoin(self.settings.defectdojo_base_url + "/", path.lstrip("/"))
+
+    def _get_json(self, path: str) -> dict:
+        response = requests.get(
+            self._api_url(path),
+            headers=self._headers(),
+            timeout=self.settings.defectdojo_request_timeout_seconds,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def _map_finding(self, raw: dict) -> DefectDojoFinding:
+        endpoints = self._extract_endpoint_values(raw.get("endpoints") or [])
+
+        product_name = self._resolve_product_name(raw)
+        return DefectDojoFinding(
+            finding_id=raw["id"],
+            title=raw.get("title") or "Untitled finding",
+            severity=raw.get("severity") or "Unknown",
+            description=raw.get("description"),
+            impact=raw.get("impact"),
+            mitigation=raw.get("mitigation"),
+            product=product_name,
+            endpoint=", ".join(endpoints) if endpoints else None,
+            date=raw.get("date"),
+            ticket_email=raw.get("ticket_email"),
+            scanner_type=self._string_or_none(raw.get("scanner_type") or raw.get("test_type")),
+            cwe=raw.get("cwe"),
+            cve=self._first_value(raw.get("cve") or raw.get("vulnerability_ids")),
+            rule_id=self._string_or_none(raw.get("rule_id") or raw.get("unique_id_from_tool")),
+            file_path=self._string_or_none(raw.get("file_path") or raw.get("file")),
+            line=self._int_or_none(raw.get("line") or raw.get("line_number")),
+            component_name=self._string_or_none(raw.get("component_name") or raw.get("component")),
+            component_version=self._string_or_none(raw.get("component_version")),
+            parameter=self._string_or_none(raw.get("parameter")),
+            resource=self._string_or_none(
+                raw.get("resource")
+                or raw.get("resource_id")
+                or raw.get("resource_arn")
+                or raw.get("asset")
+            ),
+            resource_type=self._string_or_none(raw.get("resource_type")),
+            aws_account_id=self._string_or_none(
+                raw.get("aws_account_id") or raw.get("account_id")
+            ),
+            region=self._string_or_none(raw.get("region") or raw.get("aws_region")),
+            compliance_status=self._string_or_none(raw.get("compliance_status")),
+        )
+
+    def _extract_endpoint_values(self, raw_endpoints: list) -> list[str]:
+        endpoints: list[str] = []
+        for endpoint in raw_endpoints:
+            if isinstance(endpoint, dict):
+                host = endpoint.get("host") or ""
+                path = endpoint.get("path") or ""
+                value = f"{host}{path}"
+            elif isinstance(endpoint, str):
+                value = endpoint
+            else:
+                logger.warning(
+                    "Skipping unsupported DefectDojo endpoint value",
+                    extra={"endpoint_type": type(endpoint).__name__},
+                )
+                continue
+
+            if value:
+                endpoints.append(value)
+        return endpoints
+
+    def _resolve_product_name(self, raw: dict) -> str | None:
+        product = raw.get("product")
+        if isinstance(product, dict) and product.get("name"):
+            return product["name"]
+        if isinstance(product, int):
+            return self._get_product_name(product)
+
+        test_id = self._extract_id(raw.get("test"))
+        if test_id is None:
+            return None
+
+        try:
+            test = self._get_test(test_id)
+            engagement_id = self._extract_id(test.get("engagement"))
+            if engagement_id is None:
+                return None
+            engagement = self._get_engagement(engagement_id)
+            product_id = self._extract_id(engagement.get("product"))
+            if product_id is None:
+                return None
+            return self._get_product_name(product_id)
+        except Exception as error:
+            logger.warning(
+                "Could not resolve product from DefectDojo test/engagement",
+                extra={"finding_id": raw.get("id"), "error_message": str(error)},
+            )
+            return None
+
+    def _extract_id(self, value: object) -> int | None:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, dict) and isinstance(value.get("id"), int):
+            return value["id"]
+        return None
+
+    def _get_test(self, test_id: int) -> dict:
+        if test_id not in self._test_cache:
+            self._test_cache[test_id] = self._get_json(f"api/v2/tests/{test_id}/")
+        return self._test_cache[test_id]
+
+    def _get_engagement(self, engagement_id: int) -> dict:
+        if engagement_id not in self._engagement_cache:
+            self._engagement_cache[engagement_id] = self._get_json(
+                f"api/v2/engagements/{engagement_id}/"
+            )
+        return self._engagement_cache[engagement_id]
+
+    def _get_product_name(self, product_id: int) -> str | None:
+        if product_id not in self._product_cache:
+            self._product_cache[product_id] = self._get_json(f"api/v2/products/{product_id}/")
+        return self._product_cache[product_id].get("name")
+
+    def _string_or_none(self, value: object) -> str | None:
+        if value in (None, ""):
+            return None
+        return str(value)
+
+    def _int_or_none(self, value: object) -> int | None:
+        try:
+            return int(value) if value not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    def _first_value(self, value: object) -> str | None:
+        if isinstance(value, list):
+            if not value:
+                return None
+            return self._first_value(value[0])
+        if isinstance(value, dict):
+            if not value:
+                return None
+            for key in ("vulnerability_id", "cve", "name", "id"):
+                if value.get(key):
+                    return self._string_or_none(value[key])
+            return None
+        return self._string_or_none(value)

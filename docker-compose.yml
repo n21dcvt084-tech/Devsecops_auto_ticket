@@ -1,0 +1,47 @@
+services:
+  app:
+    build: .
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: devsecops
+      POSTGRES_USER: devsecops
+      POSTGRES_PASSWORD: devsecops
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U devsecops -d devsecops"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mailpit:
+    image: axllent/mailpit:latest
+    profiles:
+      - local-mailpit
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+  mock-defectdojo:
+    image: python:3.11-slim
+    profiles:
+      - local-mock
+    command: ["python", "/mock_defectdojo/mock_server.py"]
+    volumes:
+      - ./mock_defectdojo:/mock_defectdojo:ro
+    ports:
+      - "8081:8080"
+
+volumes:
+  postgres_data:

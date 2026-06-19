@@ -1,0 +1,54 @@
+{
+  "projects": [
+    {
+      "project_name": "canhvp-demo",
+      "product_name": "canhvp-demo",
+      "email_destinations": [
+        "me.ticket.galaxy.one@gmail.com"
+      ],
+      "cc_destinations": [
+        "quyph@galaxy.one"
+      ]
+    },
+    {
+      "project_name": "check_500",
+      "product_name": "check_500",
+      "email_destinations": [
+        "me.ticket.galaxy.one@gmail.com"
+      ],
+      "cc_destinations": [
+        "quyph@galaxy.one"
+      ]
+    },
+    {
+      "project_name": "check_threagile",
+      "product_name": "check_threagile",
+      "email_destinations": [
+        "me.ticket.galaxy.one@gmail.com"
+      ],
+      "cc_destinations": [
+        "quyph@galaxy.one"
+      ]
+    },
+    {
+      "project_name": "demo-devsecops-project",
+      "product_name": "demo-devsecops-project",
+      "email_destinations": [
+        "me.ticket.galaxy.one@gmail.com"
+      ],
+      "cc_destinations": [
+        "quyph@galaxy.one"
+      ]
+    },
+    {
+      "project_name": "demo-dojo",
+      "product_name": "demo-dojo",
+      "email_destinations": [
+        "me.ticket.galaxy.one@gmail.com"
+      ],
+      "cc_destinations": [
+        "quyph@galaxy.one"
+      ]
+    }
+  ]
+}

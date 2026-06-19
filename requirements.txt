@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+requests
+SQLAlchemy
+psycopg2-binary
+psycopg[binary]
+APScheduler
+python-dotenv
+email-validator
+tenacity
+pytest
