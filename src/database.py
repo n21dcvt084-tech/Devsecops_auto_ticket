@@ -61,6 +61,7 @@ def _apply_lightweight_migrations() -> None:
         "priority": "ALTER TABLE processing_logs ADD COLUMN priority VARCHAR(80)",
         "sla_target": "ALTER TABLE processing_logs ADD COLUMN sla_target VARCHAR(80)",
         "sla_due_at": "ALTER TABLE processing_logs ADD COLUMN sla_due_at TIMESTAMP WITH TIME ZONE",
+        "to_emails": "ALTER TABLE processing_logs ADD COLUMN to_emails TEXT",
         "cc_emails": "ALTER TABLE processing_logs ADD COLUMN cc_emails TEXT",
     }
 
@@ -84,9 +85,19 @@ def _apply_lightweight_migrations() -> None:
     existing_smtp_columns = {
         column["name"] for column in inspector.get_columns("smtp_send_events")
     }
-    if "cc_emails" not in existing_smtp_columns:
-        with engine.begin() as connection:
-            connection.execute(text("ALTER TABLE smtp_send_events ADD COLUMN cc_emails TEXT"))
+    smtp_migrations = {
+        "to_emails": "ALTER TABLE smtp_send_events ADD COLUMN to_emails TEXT",
+        "cc_emails": "ALTER TABLE smtp_send_events ADD COLUMN cc_emails TEXT",
+        "flow_type": "ALTER TABLE smtp_send_events ADD COLUMN flow_type VARCHAR(80)",
+        "delivery_mode": "ALTER TABLE smtp_send_events ADD COLUMN delivery_mode VARCHAR(40)",
+    }
+    with engine.begin() as connection:
+        for column_name, ddl in smtp_migrations.items():
+            if column_name not in existing_smtp_columns:
+                connection.execute(text(ddl))
+        connection.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_smtp_send_events_flow_type ON smtp_send_events (flow_type)")
+        )
 
 
 def get_db_session() -> Generator[Session, None, None]:

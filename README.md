@@ -1,8 +1,19 @@
 # DevSecOps Auto Ticket v2
 
-DevSecOps Auto Ticket v2 is a clean rebuild of the Auto Ticket workflow documented in `docs/Auto Ticket.md`.
+DevSecOps Auto Ticket v2 automatically pulls active and verified findings from
+DefectDojo, prevents duplicate processing in PostgreSQL, and creates
+ManageEngine tickets.
 
-The backend polls active and verified findings from DefectDojo, checks duplicates in PostgreSQL, builds a ticket email/body, and delivers the finding to ManageEngine. The current deployment path uses ManageEngine Incoming Mail: the backend sends SMTP email to a ticket mailbox, then ManageEngine fetches that mailbox and creates requests.
+The current tested delivery path is `email_fetch`. For every new finding, the
+backend sends:
+
+1. A `ticket_email` to the dedicated mailbox fetched by ManageEngine Incoming
+   Mail.
+2. A separate `notify_email` to the configured project/customer recipients and
+   CC recipients.
+
+The project also contains an `api` mode for direct ticket creation through
+`POST /api/v3/requests`.
 
 The project is intentionally scoped for a demo/MVP:
 
@@ -11,7 +22,8 @@ The project is intentionally scoped for a demo/MVP:
 - Skip duplicate findings by `finding_id` and `dedupe_key`.
 - Record processing and SMTP audit logs in PostgreSQL.
 - Route tickets by product mapping instead of hardcoded project logic.
-- Send alert copies separately from ticket email so ManageEngine does not create tickets for CC recipients.
+- Separate ticket creation email from project/customer notification email.
+- Store each SMTP flow and delivery mode in the database for audit.
 - Keep the ticket lifecycle simple: `CREATE` or `SKIP`.
 
 `UPDATE`, `REOPEN`, and `CLOSE_CANDIDATE` are not enabled yet because those require confirmed ManageEngine field mapping and lifecycle rules.
@@ -23,9 +35,15 @@ DefectDojo API
   -> Backend scheduler every SCHEDULER_INTERVAL_SECONDS
   -> Finding processor
   -> PostgreSQL dedupe + audit log
-  -> SMTP email
-  -> ManageEngine Incoming Mail
-  -> ManageEngine ticket/request
+  -> New finding:
+       email_fetch:
+         -> ticket_email -> ManageEngine ticket mailbox
+         -> ManageEngine Incoming Mail -> ticket/request
+         -> notify_email -> project/customer To + CC recipients
+       api:
+         -> POST /api/v3/requests -> ticket/request
+         -> notify_email -> project/customer To + CC recipients
+  -> Duplicate finding: SKIP
 ```
 
 Supported ManageEngine delivery modes:
@@ -35,13 +53,13 @@ email_fetch: Backend sends SMTP email -> ManageEngine Incoming Mail creates tick
 api:         Backend calls ManageEngine API -> ManageEngine creates ticket directly
 ```
 
-Current demo preference:
+Current tested mode:
 
 ```text
 MANAGEENGINE_DELIVERY_MODE=email_fetch
 ```
 
-The API mode exists in code, but email fetch is the main tested path for the current demo.
+The same PostgreSQL audit schema supports both delivery modes.
 
 ## Source Layout
 
@@ -54,7 +72,7 @@ src/
   dedupe.py                Stable duplicate fingerprint
   sla.py                   Severity -> priority/SLA mapping
   email_template.py        Shared email/ticket description body
-  smtp_client.py           SMTP sender for email_fetch mode
+  smtp_client.py           SMTP sender for ticket and notification emails
   manageengine_client.py   ManageEngine API client
   manageengine_mapper.py   Finding -> ManageEngine request payload
   database.py              SQLAlchemy engine/session
@@ -66,7 +84,6 @@ src/
   health.py                Health endpoints
 tests/                     Unit tests for the core rules
 config/                    Product -> recipient mapping sample
-docs/                      Research/reference documents
 ```
 
 ## Setup
@@ -80,6 +97,15 @@ cp .env.example .env
 
 Edit `.env` locally. Do not commit `.env`.
 
+Use the JSON mapping file as the routing source:
+
+```env
+PROJECT_EMAIL_MAPPING_FILE=config/project_email_mapping.sample.json
+PROJECT_EMAIL_MAPPING_JSON=
+```
+
+If `PROJECT_EMAIL_MAPPING_JSON` contains a value, it overrides the mapping file.
+
 ## Run Tests
 
 ```bash
@@ -89,11 +115,18 @@ Edit `.env` locally. Do not commit `.env`.
 ## Start Services
 
 ```bash
-docker compose up --build -d postgres app
+docker compose build app
+docker compose up -d postgres
+docker compose run --rm -e PYTHONPATH=/app/src app python -c "from database import init_database; init_database()"
+docker compose up -d app
 docker compose logs -f app
 ```
 
-Stop app after manual tests to avoid repeated ticket creation:
+Rebuild the image after changing Python source, dependencies, Dockerfile, or a
+file copied into the image such as the JSON mapping. Changing only `.env`
+requires an app restart, not a rebuild.
+
+Stop the scheduler before one-shot manual tests:
 
 ```bash
 docker compose stop app
@@ -114,14 +147,26 @@ MANAGEENGINE_DRY_RUN=true
 Flow:
 
 ```text
-DefectDojo -> Backend -> SMTP -> mailbox -> ManageEngine Incoming Mail -> Ticket
+DefectDojo
+  -> Backend + PostgreSQL dedupe
+  -> ticket_email
+       To: ticket_mailbox only
+       Cc: none
+       -> ManageEngine Incoming Mail -> Ticket
+  -> notify_email
+       To: to_destinations
+       Cc: cc_destinations
 ```
 
 Backend requirements:
 
-- SMTP config must be valid.
-- `config/project_email_mapping.sample.json` or `PROJECT_EMAIL_MAPPING_JSON` must point the product to an approved ticket mailbox.
-- Optional `cc_destinations` sends a separate alert copy to product/team group mail. The ticket email sent to the ManageEngine mailbox intentionally has no `Cc` header.
+- SMTP configuration must be valid.
+- The project mapping must contain the exact DefectDojo product name.
+- `ticket_mailbox` is the mailbox that ManageEngine Incoming Mail fetches in `email_fetch` mode.
+- `to_destinations` contains one or more primary notification recipients.
+- `cc_destinations` contains zero or more recipients copied for tracking.
+- The backend removes duplicate addresses from To/Cc.
+- The `ticket_email` never includes notification To/Cc recipients.
 - `Ticket Routing Fields` are intentionally hidden in the email body for now.
 - Email is sent as multipart plain text + HTML. The HTML part includes a clickable DefectDojo finding link for mail clients or ManageEngine views that preserve HTML.
 - Email subject is capped at 200 characters and ends with `.....` when truncated.
@@ -140,7 +185,9 @@ Example:
     {
       "project_name": "Customer Portal Security",
       "product_name": "Customer Portal",
-      "email_destinations": ["appsec-ticket@example.com"],
+      "ticket_mailbox": "me-ticket-mailbox@example.com",
+      "to_destinations": ["customer-group@example.com", "devsecops-group@example.com"],
+      "cc_destinations": ["devsecops-archive@example.com"],
       "group": "Application Security",
       "category": "Security",
       "subcategory": "Web Vulnerability"
@@ -148,7 +195,9 @@ Example:
     {
       "project_name": "Infrastructure Security",
       "product_name": "Infrastructure",
-      "email_destinations": ["infra-ticket@example.com"],
+      "ticket_mailbox": "me-ticket-mailbox@example.com",
+      "to_destinations": ["infra-group@example.com", "devsecops-group@example.com"],
+      "cc_destinations": ["devsecops-archive@example.com"],
       "group": "Infrastructure Security",
       "category": "Security",
       "subcategory": "Infrastructure Vulnerability"
@@ -158,6 +207,16 @@ Example:
 ```
 
 For five products and two mail groups, add five entries and point each product to the correct ticket mailbox/group. This keeps routing in config instead of code.
+
+Current five-product mapping:
+
+```text
+canhvp-demo
+check_500
+check_threagile
+demo-devsecops-project
+demo-dojo
+```
 
 ManageEngine requirements:
 
@@ -194,20 +253,22 @@ Replace `demo-dojo` with the target DefectDojo product name. Keep `--limit 1` fo
 4. Check the backend audit log:
 
 ```bash
-docker compose exec -T postgres psql -U devsecops -d devsecops -c "select finding_id, status, seen_count, recipient_email, cc_emails, left(email_subject,160) as subject, processed_at, updated_at from processing_logs order by updated_at desc;"
+docker compose exec -T postgres psql -U devsecops -d devsecops -c "select finding_id, status, seen_count, to_emails, cc_emails, left(email_subject,160) as subject, processed_at, updated_at from processing_logs order by updated_at desc;"
 ```
 
 5. Check SMTP send events:
 
 ```bash
-docker compose exec -T postgres psql -U devsecops -d devsecops -c "select id, finding_id, recipient_email, cc_emails, sent_at from smtp_send_events order by sent_at desc;"
+docker compose exec -T postgres psql -U devsecops -d devsecops -c "select id, finding_id, flow_type, delivery_mode, to_emails, cc_emails, sent_at from smtp_send_events order by sent_at desc;"
 ```
 
 Expected result:
 
 ```text
 processing_logs.status = SENT
-smtp_send_events has one row per sent ticket email
+smtp_send_events contains:
+  1 ticket_email event
+  1 notify_email event
 ManageEngine creates a request after Incoming Mail fetches the mailbox
 ```
 
@@ -217,7 +278,7 @@ Run the same command again without clearing the database to validate duplicate p
 docker compose run --rm -e ALLOW_SEND_REAL_FINDING_TO_GMAIL=yes app python scripts/process_active_verified_findings_to_configured_email.py --product-name "demo-dojo" --limit 1
 ```
 
-The same finding should not create another email/ticket. `seen_count` may increase, but `smtp_send_events` should not add a duplicate row for the same finding.
+The same finding should not create another email/ticket. `seen_count` may increase, but `smtp_send_events` should not add duplicate rows for the same finding and flow.
 
 ## Manual Test: 5 Products
 
@@ -229,12 +290,13 @@ Use this flow for a broader demo across multiple DefectDojo products.
 {
   "project_name": "demo-dojo",
   "product_name": "demo-dojo",
-  "email_destinations": ["me-ticket-mailbox@example.com"],
-  "cc_destinations": ["security-alerts@example.com"]
+  "ticket_mailbox": "me-ticket-mailbox@example.com",
+  "to_destinations": ["customer-group@example.com", "devsecops-group@example.com"],
+  "cc_destinations": ["devsecops-archive@example.com"]
 }
 ```
 
-`email_destinations` should point to the mailbox that ManageEngine Incoming Mail fetches. `cc_destinations` is sent as a separate alert copy so ManageEngine does not create or route tickets for CC recipients.
+In `email_fetch` mode, backend sends one ticket email to `ticket_mailbox` only, then one notify email to `to_destinations` and copies `cc_destinations`. In `api` mode, backend creates the ticket by API first, then sends one notify email to `to_destinations` and copies `cc_destinations`.
 
 2. Rebuild the app image if the mapping file or Python code changed:
 
@@ -267,13 +329,13 @@ docker compose exec -T postgres psql -U devsecops -d devsecops -c "select 'proce
 6. Check processed findings:
 
 ```bash
-docker compose exec -T postgres psql -U devsecops -d devsecops -c "select finding_id, status, seen_count, recipient_email, cc_emails, left(email_subject,160) as subject, processed_at, updated_at from processing_logs order by updated_at desc;"
+docker compose exec -T postgres psql -U devsecops -d devsecops -c "select finding_id, status, seen_count, to_emails, cc_emails, left(email_subject,160) as subject, processed_at, updated_at from processing_logs order by updated_at desc;"
 ```
 
 7. Check send events:
 
 ```bash
-docker compose exec -T postgres psql -U devsecops -d devsecops -c "select id, finding_id, recipient_email, cc_emails, sent_at from smtp_send_events order by sent_at desc;"
+docker compose exec -T postgres psql -U devsecops -d devsecops -c "select id, finding_id, flow_type, delivery_mode, to_emails, cc_emails, sent_at from smtp_send_events order by sent_at desc;"
 ```
 
 8. Validate duplicate prevention by running the same command again without clearing the database:
@@ -287,7 +349,7 @@ Expected duplicate-test result:
 ```text
 processing_logs keeps the same finding rows
 seen_count increases when the same finding is observed again
-smtp_send_events does not create duplicate send rows for the same finding
+smtp_send_events does not create duplicate send rows for the same finding and flow
 ManageEngine should not create duplicate tickets for the same finding
 ```
 
@@ -318,6 +380,21 @@ docker compose stop app
 ## Mode 2: ManageEngine API
 
 Use this when backend creates tickets directly through ManageEngine API.
+
+Flow:
+
+```text
+DefectDojo
+  -> Backend + PostgreSQL dedupe
+  -> POST /api/v3/requests
+  -> Save ticket_id and ticket_status
+  -> notify_email
+       To: to_destinations
+       Cc: cc_destinations
+```
+
+The notification email is sent only after ManageEngine ticket creation
+succeeds.
 
 `.env` for dry-run payload validation:
 
@@ -351,12 +428,23 @@ MANAGEENGINE_DEFAULT_SUBCATEGORY=
 
 ```bash
 docker compose exec -T postgres psql -U devsecops -d devsecops -c "
-select finding_id, dedupe_key, status, recipient_email, cc_emails, ticket_id, ticket_status,
+select finding_id, dedupe_key, status, to_emails, cc_emails, ticket_id, ticket_status,
 left(coalesce(error_message,''),180) as error_message,
 processed_at, updated_at
 from processing_logs
 order by updated_at desc
 limit 20;
+"
+```
+
+Check each SMTP flow separately:
+
+```bash
+docker compose exec -T postgres psql -U devsecops -d devsecops -c "
+select id, finding_id, flow_type, delivery_mode, to_emails, cc_emails, sent_at
+from smtp_send_events
+order by sent_at desc
+limit 30;
 "
 ```
 
@@ -369,6 +457,8 @@ docker compose exec -T postgres psql -U devsecops -d devsecops -c "truncate tabl
 ## Safety Notes
 
 - Do not hardcode DefectDojo tokens, SMTP passwords, or ManageEngine tokens.
+- Never commit `.env`, private keys, certificates, or exported credentials.
+- Keep placeholders such as `XXXXXX` in `.env.example`.
 - Do not send real security findings to personal mailboxes unless explicitly approved.
-- Keep `DEFECTDOJO_FINDINGS_LIMIT=1` for manual tests to avoid creating many tickets.
+- Use `--limit 1` or `--per-product-limit 1` for the first manual test.
 - Keep `MANAGEENGINE_DRY_RUN=true` until payload mapping is reviewed.

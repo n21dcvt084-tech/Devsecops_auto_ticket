@@ -33,15 +33,5 @@ services:
       - "1025:1025"
       - "8025:8025"
 
-  mock-defectdojo:
-    image: python:3.11-slim
-    profiles:
-      - local-mock
-    command: ["python", "/mock_defectdojo/mock_server.py"]
-    volumes:
-      - ./mock_defectdojo:/mock_defectdojo:ro
-    ports:
-      - "8081:8080"
-
 volumes:
   postgres_data:

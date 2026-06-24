@@ -92,6 +92,7 @@ class ProcessingLogRepository:
         finding_id: int,
         status: ProcessingStatus,
         recipient_email: str | None = None,
+        to_emails: str | None = None,
         cc_emails: str | None = None,
         email_subject: str | None = None,
         email_body: str | None = None,
@@ -112,6 +113,7 @@ class ProcessingLogRepository:
 
         record.status = status
         record.recipient_email = recipient_email
+        record.to_emails = to_emails
         record.cc_emails = cc_emails
         record.email_subject = email_subject
         record.email_body = email_body
@@ -142,6 +144,7 @@ class ProcessingLogRepository:
         *,
         finding_id: int,
         recipient_email: str,
+        to_emails: str | None,
         cc_emails: str | None,
         email_subject: str,
         email_body: str,
@@ -155,6 +158,7 @@ class ProcessingLogRepository:
             finding_id=finding_id,
             status=ProcessingStatus.SENT,
             recipient_email=recipient_email,
+            to_emails=to_emails,
             cc_emails=cc_emails,
             email_subject=email_subject,
             email_body=email_body,
@@ -177,6 +181,7 @@ class ProcessingLogRepository:
         email_body: str | None,
         retry_count: int,
         error_message: str,
+        to_emails: str | None = None,
         cc_emails: str | None = None,
         dedupe_key: str | None = None,
     ) -> ProcessingLog:
@@ -184,6 +189,7 @@ class ProcessingLogRepository:
             finding_id=finding_id,
             status=ProcessingStatus.FAILED,
             recipient_email=recipient_email,
+            to_emails=to_emails,
             cc_emails=cc_emails,
             email_subject=email_subject,
             email_body=email_body,
@@ -198,6 +204,7 @@ class ProcessingLogRepository:
         *,
         finding_id: int,
         recipient_email: str,
+        to_emails: str | None,
         cc_emails: str | None,
         email_subject: str,
         email_body: str,
@@ -210,6 +217,7 @@ class ProcessingLogRepository:
             finding_id=finding_id,
             status=ProcessingStatus.RATE_LIMITED,
             recipient_email=recipient_email,
+            to_emails=to_emails,
             cc_emails=cc_emails,
             email_subject=email_subject,
             email_body=email_body,
@@ -321,12 +329,18 @@ class SmtpRateLimitRepository:
         *,
         finding_id: int,
         recipient_email: str,
+        to_emails: str | None = None,
         cc_emails: str | None = None,
+        flow_type: str | None = None,
+        delivery_mode: str | None = None,
     ) -> SmtpSendEvent:
         event = SmtpSendEvent(
             finding_id=finding_id,
             recipient_email=recipient_email,
+            to_emails=to_emails,
             cc_emails=cc_emails,
+            flow_type=flow_type,
+            delivery_mode=delivery_mode,
         )
         self.db.add(event)
         self.db.commit()

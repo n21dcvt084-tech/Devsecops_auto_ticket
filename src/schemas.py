@@ -65,6 +65,7 @@ class DefectDojoFinding(BaseModel):
 class EmailPayload(BaseModel):
     finding_id: int
     recipient_email: EmailStr
+    to_emails: list[EmailStr] = Field(default_factory=list)
     cc_emails: list[EmailStr] = Field(default_factory=list)
     subject: str
     body: str
@@ -78,8 +79,11 @@ class EmailPayload(BaseModel):
 class ProjectEmailMapping(BaseModel):
     project_name: str
     product_name: str
+    ticket_mailbox: EmailStr | None = None
+    to_destinations: list[EmailStr] = Field(default_factory=list)
     email_destinations: list[EmailStr] = Field(default_factory=list)
     cc_destinations: list[EmailStr] = Field(default_factory=list)
+    alert_destinations: list[EmailStr] = Field(default_factory=list)
     group: str | None = None
     category: str | None = None
     subcategory: str | None = None

@@ -21,10 +21,16 @@ class SmtpRateLimiter:
         *,
         finding_id: int,
         recipient_email: str,
+        to_emails: str | None = None,
         cc_emails: str | None = None,
+        flow_type: str | None = None,
+        delivery_mode: str | None = None,
     ) -> None:
         self.repository.record_send(
             finding_id=finding_id,
             recipient_email=recipient_email,
+            to_emails=to_emails,
             cc_emails=cc_emails,
+            flow_type=flow_type,
+            delivery_mode=delivery_mode,
         )

@@ -116,10 +116,17 @@ class FindingProcessor:
                 )
                 continue
 
+            queued_to_recipients = self._parse_email_list(item.to_emails)
+            queued_cc_recipients = self._parse_email_list(item.cc_emails)
             payload = EmailPayload(
                 finding_id=item.finding_id,
                 recipient_email=item.recipient_email,
-                cc_emails=self._parse_email_list(item.cc_emails),
+                to_emails=[
+                    email
+                    for email in queued_to_recipients
+                    if email.lower() != item.recipient_email.lower()
+                ],
+                cc_emails=queued_cc_recipients,
                 subject=item.email_subject,
                 body=item.email_body,
                 dedupe_key=item.dedupe_key,
@@ -127,7 +134,10 @@ class FindingProcessor:
                 sla_target=item.sla_target,
                 ticket_action=TicketAction.CREATE,
             )
-            self._send_with_retry(payload)
+            self._send_with_retry(
+                payload,
+                flow_type="ticket_email",
+            )
 
     def process_finding(self, finding: DefectDojoFinding) -> None:
         dedupe_key = build_dedupe_key(finding)
@@ -186,18 +196,26 @@ class FindingProcessor:
             return
 
         ticket_action = TicketAction.CREATE
+        project_mapping = self._resolve_project_mapping(finding)
         if self._use_manageengine_api():
-            self._sync_manageengine_ticket(
+            ticket_synced = self._sync_manageengine_ticket(
                 finding=finding,
                 dedupe_key=dedupe_key,
                 sla_policy=sla_policy,
                 ticket_action=ticket_action,
             )
+            if ticket_synced:
+                self._send_notification_email(
+                    finding=finding,
+                    dedupe_key=dedupe_key,
+                    sla_policy=sla_policy,
+                    ticket_action=ticket_action,
+                    project_mapping=project_mapping,
+                )
             return
 
-        project_mapping = self._resolve_project_mapping(finding)
-        recipient = self._resolve_recipient(finding, project_mapping)
-        if not recipient:
+        ticket_mailbox = self._resolve_ticket_mailbox(finding, project_mapping)
+        if not ticket_mailbox:
             self.processing_logs.mark_invalid_recipient(
                 finding_id=finding.finding_id,
                 error_message="No valid recipient from ticket_email or project mapping",
@@ -218,11 +236,11 @@ class FindingProcessor:
             )
             return
 
-        cc_recipients = self._resolve_cc_recipients(project_mapping, recipient)
-        payload = self._build_email_payload(
+        ticket_payload = self._build_email_payload(
             finding=finding,
-            recipient=recipient,
-            cc_recipients=cc_recipients,
+            recipient=ticket_mailbox,
+            to_recipients=[],
+            cc_recipients=[],
             dedupe_key=dedupe_key,
             sla_policy=sla_policy,
             ticket_action=ticket_action,
@@ -232,10 +250,11 @@ class FindingProcessor:
         if not self.rate_limiter.quota_available():
             self.processing_logs.mark_rate_limited(
                 finding_id=finding.finding_id,
-                recipient_email=str(payload.recipient_email),
-                cc_emails=self._format_email_list(payload.cc_emails),
-                email_subject=payload.subject,
-                email_body=payload.body,
+                recipient_email=str(ticket_payload.recipient_email),
+                to_emails=self._format_email_list(self._payload_to_recipients(ticket_payload)),
+                cc_emails=self._format_email_list(ticket_payload.cc_emails),
+                email_subject=ticket_payload.subject,
+                email_body=ticket_payload.body,
                 dedupe_key=dedupe_key,
                 priority=sla_policy.priority,
                 sla_target=sla_policy.target,
@@ -246,13 +265,24 @@ class FindingProcessor:
                 extra={
                     "finding_id": finding.finding_id,
                     "dedupe_key": dedupe_key,
-                    "recipient_email": str(payload.recipient_email),
+                    "recipient_email": str(ticket_payload.recipient_email),
                     "status": ProcessingStatus.RATE_LIMITED.value,
                 },
             )
             return
 
-        self._send_with_retry(payload)
+        ticket_sent = self._send_with_retry(
+            ticket_payload,
+            flow_type="ticket_email",
+        )
+        if ticket_sent:
+            self._send_notification_email(
+                finding=finding,
+                dedupe_key=dedupe_key,
+                sla_policy=sla_policy,
+                ticket_action=ticket_action,
+                project_mapping=project_mapping,
+            )
 
     def _select_duplicate_record(
         self,
@@ -283,6 +313,7 @@ class FindingProcessor:
         sla_policy: SlaPolicy,
         ticket_action: TicketAction,
         project_mapping: ProjectEmailMapping | None = None,
+        to_recipients: list[str] | None = None,
         cc_recipients: list[str] | None = None,
     ) -> EmailPayload:
         group = (
@@ -317,6 +348,7 @@ class FindingProcessor:
         return EmailPayload(
             finding_id=content.finding_id,
             recipient_email=recipient,
+            to_emails=to_recipients or [],
             cc_emails=cc_recipients or [],
             subject=content.subject,
             body=content.body,
@@ -334,7 +366,7 @@ class FindingProcessor:
         dedupe_key: str,
         sla_policy: SlaPolicy,
         ticket_action: TicketAction,
-    ) -> None:
+    ) -> bool:
         payload = build_manageengine_payload(
             finding=finding,
             settings=self.settings,
@@ -364,6 +396,7 @@ class FindingProcessor:
                     "ticket_status": result.status,
                 },
             )
+            return True
         except Exception as error:
             self.processing_logs.mark_failed(
                 finding_id=finding.finding_id,
@@ -382,11 +415,16 @@ class FindingProcessor:
                     "error_message": str(error),
                 },
             )
+            return False
 
     def _send_with_retry(
         self,
         payload: EmailPayload,
-    ) -> None:
+        *,
+        flow_type: str = "ticket_email",
+        update_processing_log: bool = True,
+        fail_processing_log: bool = True,
+    ) -> bool:
         max_attempts = self.settings.smtp_max_attempts
         last_error: Exception | None = None
 
@@ -394,35 +432,45 @@ class FindingProcessor:
         for attempt in range(1, max_attempts + 1):
             attempts_made = attempt
             try:
-                ticket_payload = payload.model_copy(update={"cc_emails": []})
-                self.smtp_client.send(ticket_payload)
-                self._send_alert_copy(payload)
+                self.smtp_client.send(payload)
                 self.rate_limiter.record_send(
                     finding_id=payload.finding_id,
                     recipient_email=str(payload.recipient_email),
+                    to_emails=self._format_email_list(self._payload_to_recipients(payload)),
                     cc_emails=self._format_email_list(payload.cc_emails),
+                    flow_type=flow_type,
+                    delivery_mode=self.settings.manageengine_delivery_mode,
                 )
-                self.processing_logs.mark_sent(
-                    finding_id=payload.finding_id,
-                    recipient_email=str(payload.recipient_email),
-                    cc_emails=self._format_email_list(payload.cc_emails),
-                    email_subject=payload.subject,
-                    email_body=payload.body,
-                    retry_count=attempt - 1,
-                    dedupe_key=payload.dedupe_key,
-                    priority=payload.priority,
-                    sla_target=payload.sla_target,
-                )
+                if update_processing_log:
+                    self.processing_logs.mark_sent(
+                        finding_id=payload.finding_id,
+                        recipient_email=str(payload.recipient_email),
+                        to_emails=self._format_email_list(
+                            self._payload_to_recipients(payload)
+                        ),
+                        cc_emails=self._format_email_list(payload.cc_emails),
+                        email_subject=payload.subject,
+                        email_body=payload.body,
+                        retry_count=attempt - 1,
+                        dedupe_key=payload.dedupe_key,
+                        priority=payload.priority,
+                        sla_target=payload.sla_target,
+                    )
                 logger.info(
                     "Email sent",
                     extra={
                         "finding_id": payload.finding_id,
                         "dedupe_key": payload.dedupe_key,
                         "recipient_email": str(payload.recipient_email),
+                        "to_emails": self._format_email_list(
+                            self._payload_to_recipients(payload)
+                        ),
+                        "cc_emails": self._format_email_list(payload.cc_emails),
+                        "flow_type": flow_type,
                         "status": ProcessingStatus.SENT.value,
                     },
                 )
-                return
+                return True
             except Exception as error:
                 last_error = error
                 logger.warning(
@@ -431,6 +479,7 @@ class FindingProcessor:
                         "finding_id": payload.finding_id,
                         "dedupe_key": payload.dedupe_key,
                         "recipient_email": str(payload.recipient_email),
+                        "flow_type": flow_type,
                         "error_message": str(error),
                     },
                 )
@@ -448,10 +497,24 @@ class FindingProcessor:
                         "finding_id": payload.finding_id,
                         "dedupe_key": payload.dedupe_key,
                         "recipient_email": str(payload.recipient_email),
+                        "flow_type": flow_type,
                         "error_message": f"retry_after_seconds={delay}",
                     },
                 )
                 time.sleep(delay)
+
+        if not fail_processing_log:
+            logger.info(
+                "Email flow failed without changing finding status",
+                extra={
+                    "finding_id": payload.finding_id,
+                    "dedupe_key": payload.dedupe_key,
+                    "recipient_email": str(payload.recipient_email),
+                    "flow_type": flow_type,
+                    "error_message": str(last_error) if last_error else "SMTP send failed",
+                },
+            )
+            return False
 
         existing_log = self.processing_logs.get_by_finding_id(payload.finding_id)
         retry_count = max(
@@ -461,6 +524,7 @@ class FindingProcessor:
         self.processing_logs.mark_failed(
             finding_id=payload.finding_id,
             recipient_email=str(payload.recipient_email),
+            to_emails=self._format_email_list(self._payload_to_recipients(payload)),
             cc_emails=self._format_email_list(payload.cc_emails),
             email_subject=payload.subject,
             email_body=payload.body,
@@ -474,34 +538,63 @@ class FindingProcessor:
                 "finding_id": payload.finding_id,
                 "dedupe_key": payload.dedupe_key,
                 "recipient_email": str(payload.recipient_email),
+                "flow_type": flow_type,
                 "status": ProcessingStatus.FAILED.value,
                 "error_message": str(last_error) if last_error else "SMTP send failed",
             },
         )
+        return False
 
-    def _send_alert_copy(self, payload: EmailPayload) -> None:
-        if not payload.cc_emails:
-            return
-
-        alert_payload = payload.model_copy(
-            update={
-                "recipient_email": payload.cc_emails[0],
-                "cc_emails": payload.cc_emails[1:],
-            }
-        )
-        try:
-            self.smtp_client.send(alert_payload)
-        except Exception as error:
-            logger.warning(
-                "Alert copy send failed after ticket email was sent",
+    def _send_notification_email(
+        self,
+        *,
+        finding: DefectDojoFinding,
+        dedupe_key: str,
+        sla_policy: SlaPolicy,
+        ticket_action: TicketAction,
+        project_mapping: ProjectEmailMapping | None,
+    ) -> None:
+        to_recipients = self._resolve_notify_to_recipients(project_mapping)
+        if not to_recipients:
+            logger.info(
+                "Notification email skipped because no to_destinations are configured",
                 extra={
-                    "finding_id": payload.finding_id,
-                    "dedupe_key": payload.dedupe_key,
-                    "recipient_email": str(alert_payload.recipient_email),
-                    "cc_emails": self._format_email_list(alert_payload.cc_emails),
-                    "error_message": str(error),
+                    "finding_id": finding.finding_id,
+                    "dedupe_key": dedupe_key,
+                    "flow_type": "notify_email",
                 },
             )
+            return
+
+        cc_recipients = self._resolve_cc_recipients(project_mapping, to_recipients)
+        if not self.rate_limiter.quota_available():
+            logger.warning(
+                "Notification email skipped because SMTP rate limit is active",
+                extra={
+                    "finding_id": finding.finding_id,
+                    "dedupe_key": dedupe_key,
+                    "recipient_email": to_recipients[0],
+                    "flow_type": "notify_email",
+                },
+            )
+            return
+
+        payload = self._build_email_payload(
+            finding=finding,
+            recipient=to_recipients[0],
+            to_recipients=to_recipients[1:],
+            cc_recipients=cc_recipients,
+            dedupe_key=dedupe_key,
+            sla_policy=sla_policy,
+            ticket_action=ticket_action,
+            project_mapping=project_mapping,
+        )
+        self._send_with_retry(
+            payload,
+            flow_type="notify_email",
+            update_processing_log=False,
+            fail_processing_log=False,
+        )
 
     def _resolve_project_mapping(
         self, finding: DefectDojoFinding
@@ -528,16 +621,89 @@ class FindingProcessor:
                 return valid_destination
         return None
 
+    def _resolve_ticket_recipients(
+        self,
+        finding: DefectDojoFinding,
+        project_mapping: ProjectEmailMapping | None = None,
+    ) -> list[str]:
+        ticket_email = self._validate_email(finding.ticket_email)
+        if ticket_email:
+            return [ticket_email]
+
+        if not project_mapping:
+            return []
+
+        recipients: list[str] = []
+        seen: set[str] = set()
+        for destination in project_mapping.email_destinations:
+            valid_destination = self._validate_email(destination)
+            if not valid_destination:
+                continue
+            normalized = valid_destination.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            recipients.append(valid_destination)
+        return recipients
+
+    def _resolve_email_fetch_to_recipients(
+        self,
+        finding: DefectDojoFinding,
+        project_mapping: ProjectEmailMapping | None = None,
+    ) -> list[str]:
+        ticket_mailbox = self._resolve_ticket_mailbox(finding, project_mapping)
+        if not ticket_mailbox:
+            return []
+
+        notify_recipients = self._resolve_notify_to_recipients(project_mapping)
+        return self._dedupe_email_values([ticket_mailbox, *notify_recipients])
+
+    def _resolve_ticket_mailbox(
+        self,
+        finding: DefectDojoFinding,
+        project_mapping: ProjectEmailMapping | None = None,
+    ) -> str | None:
+        ticket_email = self._validate_email(finding.ticket_email)
+        if ticket_email:
+            return ticket_email
+
+        if not project_mapping:
+            return None
+
+        ticket_mailbox = self._validate_email(project_mapping.ticket_mailbox)
+        if ticket_mailbox:
+            return ticket_mailbox
+
+        for destination in project_mapping.email_destinations:
+            valid_destination = self._validate_email(destination)
+            if valid_destination:
+                return valid_destination
+        return None
+
+    def _resolve_notify_to_recipients(
+        self, project_mapping: ProjectEmailMapping | None
+    ) -> list[str]:
+        if not project_mapping:
+            return []
+
+        configured_destinations = (
+            project_mapping.to_destinations or project_mapping.alert_destinations
+        )
+        return self._dedupe_email_values(configured_destinations)
+
     def _resolve_cc_recipients(
         self,
         project_mapping: ProjectEmailMapping | None,
-        recipient: str,
+        excluded_recipients: str | list[str],
     ) -> list[str]:
         if not project_mapping:
             return []
 
         recipients: list[str] = []
-        seen = {recipient.lower()}
+        if isinstance(excluded_recipients, str):
+            seen = {excluded_recipients.lower()}
+        else:
+            seen = {recipient.lower() for recipient in excluded_recipients}
         for destination in project_mapping.cc_destinations:
             valid_destination = self._validate_email(destination)
             if not valid_destination:
@@ -547,6 +713,49 @@ class FindingProcessor:
                 continue
             seen.add(normalized)
             recipients.append(valid_destination)
+        return recipients
+
+    def _resolve_alert_recipients(
+        self,
+        project_mapping: ProjectEmailMapping | None,
+        excluded_recipients: list[str],
+    ) -> list[str]:
+        if not project_mapping:
+            return []
+
+        configured_destinations = (
+            project_mapping.alert_destinations or project_mapping.cc_destinations
+        )
+        recipients: list[str] = []
+        seen = {recipient.lower() for recipient in excluded_recipients}
+        for destination in configured_destinations:
+            valid_destination = self._validate_email(destination)
+            if not valid_destination:
+                continue
+            normalized = valid_destination.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            recipients.append(valid_destination)
+        return recipients
+
+    def _payload_to_recipients(self, payload: EmailPayload) -> list[str]:
+        return self._dedupe_email_values(
+            [str(payload.recipient_email), *[str(email) for email in payload.to_emails]]
+        )
+
+    def _dedupe_email_values(self, values: list[EmailStr] | list[str]) -> list[str]:
+        recipients: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            valid_value = self._validate_email(str(value))
+            if not valid_value:
+                continue
+            normalized = valid_value.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            recipients.append(valid_value)
         return recipients
 
     def _format_email_list(self, values: list[EmailStr] | list[str]) -> str | None:

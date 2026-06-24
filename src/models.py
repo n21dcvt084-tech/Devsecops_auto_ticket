@@ -53,6 +53,7 @@ class ProcessingLog(Base):
     sla_target: Mapped[str | None] = mapped_column(String(80), nullable=True)
     sla_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     recipient_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    to_emails: Mapped[str | None] = mapped_column(Text, nullable=True)
     cc_emails: Mapped[str | None] = mapped_column(Text, nullable=True)
     email_subject: Mapped[str | None] = mapped_column(String(500), nullable=True)
     email_body: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -79,7 +80,10 @@ class SmtpSendEvent(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     finding_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     recipient_email: Mapped[str] = mapped_column(String(320), nullable=False)
+    to_emails: Mapped[str | None] = mapped_column(Text, nullable=True)
     cc_emails: Mapped[str | None] = mapped_column(Text, nullable=True)
+    flow_type: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    delivery_mode: Mapped[str | None] = mapped_column(String(40), nullable=True)
     sent_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False, index=True
     )

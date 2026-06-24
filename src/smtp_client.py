@@ -12,7 +12,9 @@ class SmtpClient:
     def send(self, payload: EmailPayload) -> None:
         message = EmailMessage()
         message["From"] = self.settings.smtp_from_email
-        message["To"] = str(payload.recipient_email)
+        to_recipients = [str(payload.recipient_email)]
+        to_recipients.extend(str(email) for email in payload.to_emails)
+        message["To"] = ", ".join(dict.fromkeys(to_recipients))
         if payload.cc_emails:
             message["Cc"] = ", ".join(str(email) for email in payload.cc_emails)
         message["Subject"] = payload.subject
