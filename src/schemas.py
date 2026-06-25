@@ -1,34 +1,19 @@
+"""Define validated data contracts exchanged between application modules."""
+
 from datetime import date, datetime
 from enum import Enum
-
 from pydantic import BaseModel, EmailStr, Field
 
 
-class ProcessingStatusValue(str, Enum):
-    PENDING = "PENDING"
-    SENT = "SENT"
-    FAILED = "FAILED"
-    SKIPPED = "SKIPPED"
-    RATE_LIMITED = "RATE_LIMITED"
-    INVALID_RECIPIENT = "INVALID_RECIPIENT"
-
-
-class TicketLifecycleStatus(str, Enum):
-    OPEN = "OPEN"
-    RESOLVED_CANDIDATE = "RESOLVED_CANDIDATE"
-    CLOSED = "CLOSED"
-    REOPENED = "REOPENED"
-    SUPPRESSED = "SUPPRESSED"
-
-
 class TicketAction(str, Enum):
+    """Ticket action supported by the current CREATE-only lifecycle."""
+
     CREATE = "CREATE"
-    UPDATE = "UPDATE"
-    REOPEN = "REOPEN"
-    CLOSE_CANDIDATE = "CLOSE_CANDIDATE"
 
 
 class SlaPolicy(BaseModel):
+    """Internal priority, target, and due date derived from severity."""
+
     severity: str
     priority: str
     target: str
@@ -36,6 +21,8 @@ class SlaPolicy(BaseModel):
 
 
 class DefectDojoFinding(BaseModel):
+    """Normalized representation of a finding returned by DefectDojo."""
+
     finding_id: int
     title: str
     severity: str
@@ -63,6 +50,8 @@ class DefectDojoFinding(BaseModel):
 
 
 class EmailPayload(BaseModel):
+    """Complete plain-text and HTML message passed to the SMTP client."""
+
     finding_id: int
     recipient_email: EmailStr
     to_emails: list[EmailStr] = Field(default_factory=list)
@@ -77,23 +66,26 @@ class EmailPayload(BaseModel):
 
 
 class ProjectEmailMapping(BaseModel):
-    project_name: str
+    """Per-product ticket mailbox, notification recipients, and routing fields."""
+
     product_name: str
     ticket_mailbox: EmailStr | None = None
     to_destinations: list[EmailStr] = Field(default_factory=list)
-    email_destinations: list[EmailStr] = Field(default_factory=list)
     cc_destinations: list[EmailStr] = Field(default_factory=list)
-    alert_destinations: list[EmailStr] = Field(default_factory=list)
     group: str | None = None
     category: str | None = None
     subcategory: str | None = None
 
 
 class ProjectEmailMappingConfig(BaseModel):
+    """Root schema for the project mapping JSON file."""
+
     projects: list[ProjectEmailMapping] = Field(default_factory=list)
 
 
 class ManageEngineRequestPayload(BaseModel):
+    """Normalized request fields required by the ManageEngine API client."""
+
     finding_id: int
     subject: str
     description: str
@@ -111,6 +103,8 @@ class ManageEngineRequestPayload(BaseModel):
 
 
 class ManageEngineRequestResult(BaseModel):
+    """Relevant ticket information parsed from a ManageEngine API response."""
+
     request_id: str | None = None
     status: str
     raw_response: dict = Field(default_factory=dict)

@@ -1,15 +1,45 @@
+"""Build and send SMTP messages and classify retryable transport errors."""
+
 import smtplib
+import socket
 from email.message import EmailMessage
 
 from config import Settings
 from schemas import EmailPayload
 
 
+def retry_delay_seconds(
+    *,
+    attempt_number: int,
+    base_delay_seconds: int,
+    backoff_multiplier: int,
+) -> int:
+    """Calculate exponential retry delay for the supplied attempt number."""
+    return base_delay_seconds * (backoff_multiplier ** max(attempt_number - 1, 0))
+
+
+def is_transient_smtp_error(error: Exception) -> bool:
+    """Return whether an SMTP/network error is safe to retry."""
+    if isinstance(error, (TimeoutError, socket.timeout, ConnectionResetError)):
+        return True
+    if isinstance(error, smtplib.SMTPServerDisconnected):
+        return True
+    if isinstance(error, smtplib.SMTPConnectError):
+        return True
+    if isinstance(error, smtplib.SMTPResponseException):
+        return 400 <= error.smtp_code < 500
+    return False
+
+
 class SmtpClient:
+    """Send multipart messages through authenticated SMTP with optional TLS."""
+
     def __init__(self, settings: Settings):
+        """Store SMTP connection and sender settings."""
         self.settings = settings
 
     def send(self, payload: EmailPayload) -> None:
+        """Build one EmailMessage from the payload and submit it to SMTP."""
         message = EmailMessage()
         message["From"] = self.settings.smtp_from_email
         to_recipients = [str(payload.recipient_email)]

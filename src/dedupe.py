@@ -1,3 +1,5 @@
+"""Generate stable logical-issue fingerprints for duplicate prevention."""
+
 import hashlib
 import re
 
@@ -15,6 +17,7 @@ def build_dedupe_key(finding: DefectDojoFinding) -> str:
 
 
 def _fingerprint_parts(finding: DefectDojoFinding) -> list[object | None]:
+    """Select stable fingerprint fields based on the finding type."""
     if finding.cve and finding.component_name:
         return [
             "dependency",
@@ -51,6 +54,7 @@ def _fingerprint_parts(finding: DefectDojoFinding) -> list[object | None]:
 
 
 def _normalize(value: object) -> str:
+    """Normalize one fingerprint component before hashing."""
     text = str(value).strip().lower()
     text = re.sub(r"\s+", " ", text)
     return text

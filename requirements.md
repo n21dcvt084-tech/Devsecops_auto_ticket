@@ -84,11 +84,11 @@ Fingerprint fields vary by finding type:
 New configuration must use:
 
 ```env
-PROJECT_EMAIL_MAPPING_FILE=config/project_email_mapping.sample.json
-PROJECT_EMAIL_MAPPING_JSON=
+PROJECT_EMAIL_MAPPING_FILE=config/project_mapping.json
 ```
 
-If `PROJECT_EMAIL_MAPPING_JSON` is non-empty, it overrides the file.
+If `PROJECT_EMAIL_MAPPING_JSON` is explicitly set, it overrides entries from
+the file.
 
 Mapping schema:
 
@@ -96,7 +96,6 @@ Mapping schema:
 {
   "projects": [
     {
-      "project_name": "Customer Portal Security",
       "product_name": "Customer Portal",
       "ticket_mailbox": "ticket-mailbox@example.com",
       "to_destinations": [
@@ -118,12 +117,12 @@ Rules:
 
 - `product_name` must match the resolved DefectDojo product name.
 - `ticket_mailbox` is the mailbox used to create tickets in `email_fetch`.
-- `to_destinations` contains primary notification recipients.
+- `to_destinations` contains primary notification recipients. Each address
+  receives its own independent notification email and is the only address in
+  that email's `To` header.
 - `cc_destinations` contains optional notification-copy recipients.
 - Duplicate addresses must be removed.
 - An address already in To must not also appear in Cc.
-- Legacy `email_destinations` and `alert_destinations` may remain as fallback
-  compatibility fields, but must not be used in new configuration.
 
 ## 6. Required Delivery Modes
 
@@ -133,7 +132,6 @@ Configuration:
 
 ```env
 MANAGEENGINE_DELIVERY_MODE=email_fetch
-MANAGEENGINE_ENABLED=false
 ```
 
 For each new finding, backend must send two independent email flows when
@@ -155,7 +153,7 @@ Purpose:
 #### `notify_email`
 
 ```text
-To: to_destinations
+To: one address from to_destinations per email
 Cc: cc_destinations
 ```
 
@@ -175,7 +173,6 @@ Configuration:
 
 ```env
 MANAGEENGINE_DELIVERY_MODE=api
-MANAGEENGINE_ENABLED=true
 ```
 
 Behavior:
@@ -183,8 +180,8 @@ Behavior:
 1. Build ManageEngine request payload.
 2. Call `POST /api/v3/requests`.
 3. Store returned `ticket_id` and `ticket_status`.
-4. Send one `notify_email` to `to_destinations` and `cc_destinations` only
-   after ticket creation succeeds.
+4. Send one independent `notify_email` per `to_destinations` address, with
+   `cc_destinations` copied, only after ticket creation succeeds.
 
 With `MANAGEENGINE_DRY_RUN=true`, payload construction must be validated without
 creating a real request.
@@ -205,6 +202,10 @@ credentials.
 
 ## 8. PostgreSQL Audit Requirements
 
+Database schema changes must be applied through versioned Alembic migrations
+before FastAPI starts. Application startup must not create, alter, truncate, or
+drop database tables.
+
 ### `processing_logs`
 
 Must support:
@@ -215,13 +216,13 @@ dedupe_key
 status
 seen_count
 recipient_email
-to_emails
-cc_emails
 ticket_id
 ticket_status
 email_subject
 email_body
+email_html_body
 retry_count
+next_attempt_at
 error_message
 priority
 sla_target
@@ -236,12 +237,51 @@ Every successful SMTP send must record:
 ```text
 finding_id
 recipient_email
-to_emails
 cc_emails
 flow_type
 delivery_mode
 sent_at
 ```
+
+### `dedupe_claims`
+
+Must provide an expiring database lease for each logical `dedupe_key`:
+
+```text
+dedupe_key
+finding_id
+lease_owner
+lease_expires_at
+timestamps
+```
+
+The lease must prevent concurrent workers from processing the same logical
+finding and must expire so another worker can recover after a crash.
+
+### `notification_deliveries`
+
+Must persist one independent delivery per `finding_id + recipient_email`:
+
+```text
+finding_id
+dedupe_key
+recipient_email
+cc_emails
+email_subject
+email_body
+email_html_body
+status
+retry_count
+next_attempt_at
+error_message
+lease_owner
+lease_expires_at
+sent_at
+timestamps
+```
+
+Notification retry state must survive application restart and must not require
+the finding to remain in the next DefectDojo API response.
 
 Supported `flow_type` values:
 
@@ -254,13 +294,13 @@ Expected events for one new finding:
 
 | Mode | Expected SMTP events |
 | --- | --- |
-| `email_fetch` with notification recipients | One `ticket_email` and one `notify_email` |
+| `email_fetch` with notification recipients | One `ticket_email` plus one `notify_email` per To recipient |
 | `email_fetch` without notification recipients | One `ticket_email` |
-| `api` after successful ticket creation | One `notify_email` |
+| `api` after successful ticket creation | One `notify_email` per To recipient |
 | Duplicate finding | No new SMTP events |
 
-Database initialization must apply lightweight migrations for existing local
-databases.
+Alembic migrations must support both a new database and an existing compatible
+database without deleting audit rows.
 
 ## 9. Email Content Requirements
 
@@ -317,6 +357,8 @@ Scheduler must:
 - Run one cycle immediately when the app starts.
 - Poll again every configured interval.
 - Use `max_instances=1`.
+- Use a PostgreSQL scheduler lease to prevent multiple app instances from
+  polling concurrently.
 - Create and close a database session per cycle.
 
 One-shot tests must stop the app scheduler first to avoid concurrent polling.
@@ -324,9 +366,11 @@ One-shot tests must stop the app scheduler first to avoid concurrent polling.
 ## 13. SMTP Reliability Requirements
 
 - Support authenticated SMTP with TLS.
-- Support multiple To and Cc recipients.
+- Support multiple configured recipients by sending one email per To recipient;
+  each email may include the configured Cc recipients.
 - Enforce per-minute and per-hour quotas.
-- Retry transient SMTP failures using configurable backoff.
+- Persist transient SMTP failures with configurable backoff and retry them in a
+  later scheduler cycle instead of blocking the worker with long sleeps.
 - Record an SMTP event only after successful send.
 - Prevent duplicated addresses across recipient lists.
 
@@ -341,7 +385,7 @@ One-shot tests must stop the app scheduler first to avoid concurrent polling.
 - Real findings may be sent only to explicitly approved destinations.
 - The guarded real-email script must require
   `ALLOW_SEND_REAL_FINDING_TO_GMAIL=yes`.
-- Mailpit must remain available for safe email testing.
+- Unit tests and guarded limited SMTP tests must remain available for safe validation.
 
 ## 15. Acceptance Criteria
 
@@ -353,26 +397,26 @@ The implementation is accepted when:
 - Duplicate findings do not create additional emails or tickets.
 - `email_fetch` sends separate `ticket_email` and `notify_email` flows.
 - Ticket email contains no notification Cc recipients.
-- Notify email supports multiple To and Cc recipients.
+- Notify flow sends one independent email per To recipient and supports Cc.
 - API mode stores ticket result and sends notification after success.
-- PostgreSQL records `to_emails`, `cc_emails`, `flow_type`, and
-  `delivery_mode`.
+- PostgreSQL records `recipient_email`, `cc_emails`, `flow_type`, and
+  `delivery_mode` for each individual SMTP send.
 - Email templates are adaptive, HTML-safe, and omit empty fields.
 - Subject truncation and contextual redaction are tested.
 - SLA mapping returns the documented values.
 - SMTP retry and rate-limit behavior are tested.
 - Unit test suite passes.
 
-Latest verified result on 24/06/2026:
+Latest verified result on 25/06/2026:
 
 ```text
-41 passed
+49 passed
 ```
 
 ## 16. Manual Test Guardrails
 
 - Start with `--limit 1` or `--per-product-limit 1`.
-- Test Mailpit before configured real SMTP.
+- Run unit tests before configured real SMTP.
 - Use `--clear-db` only when a clean test is explicitly required.
 - Do not clear database before the second duplicate-test run.
 - Clearing backend tables does not delete ManageEngine tickets or mailbox

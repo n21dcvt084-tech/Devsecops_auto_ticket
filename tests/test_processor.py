@@ -7,13 +7,26 @@ from sqlalchemy.orm import sessionmaker
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-import models  # noqa: F401
+import db_models  # noqa: F401
 from config import Settings
 from database import Base
-from models import ProcessingLog, ProcessingStatus, SmtpSendEvent
+from db_models import (
+    NotificationDelivery,
+    NotificationStatus,
+    ProcessingLog,
+    ProcessingStatus,
+    SmtpSendEvent,
+)
 from processor import FindingProcessor
-from schemas import DefectDojoFinding, EmailPayload, ManageEngineRequestResult, TicketAction
-from sla import policy_for_severity
+from repositories import ClaimResult, DedupeClaimRepository
+from schemas import (
+    DefectDojoFinding,
+    EmailPayload,
+    ManageEngineRequestResult,
+    ProjectEmailMapping,
+    TicketAction,
+)
+from manageengine_mapper import policy_for_severity
 
 
 def build_settings(**overrides):
@@ -24,7 +37,6 @@ def build_settings(**overrides):
         "SMTP_HOST": "localhost",
         "SMTP_FROM_EMAIL": "devsecops@example.com",
         "MANAGEENGINE_DELIVERY_MODE": "api",
-        "MANAGEENGINE_ENABLED": True,
         "MANAGEENGINE_DRY_RUN": True,
         "MANAGEENGINE_BASE_URL": "https://servicedesk.example.com",
         "PROJECT_EMAIL_MAPPING_FILE": "",
@@ -41,14 +53,16 @@ def build_session():
 
 
 class FakeManageEngineClient:
-    def __init__(self):
+    def __init__(self, status="DRY_RUN", request_id=None):
         self.created_payloads = []
+        self.status = status
+        self.request_id = request_id
 
     def create_request(self, payload):
         self.created_payloads.append(payload)
         return ManageEngineRequestResult(
-            request_id=None,
-            status="DRY_RUN",
+            request_id=self.request_id,
+            status=self.status,
             raw_response={"input_data": {"request": {"subject": payload.subject}}},
         )
 
@@ -67,7 +81,18 @@ def build_finding(finding_id: int) -> DefectDojoFinding:
     )
 
 
-def test_process_finding_api_dry_run_records_ticket_created_audit_log():
+def test_project_mapping_defines_ticket_and_notification_recipients():
+    mapping = ProjectEmailMapping(
+        product_name="Customer Portal",
+        ticket_mailbox="appsec-ticket@example.com",
+        to_destinations=["team@example.com"],
+    )
+
+    assert str(mapping.ticket_mailbox) == "appsec-ticket@example.com"
+    assert [str(email) for email in mapping.to_destinations] == ["team@example.com"]
+
+
+def test_process_finding_api_dry_run_remains_pending():
     db = build_session()
     processor = FindingProcessor(build_settings(), db)
     fake_manageengine = FakeManageEngineClient()
@@ -77,7 +102,7 @@ def test_process_finding_api_dry_run_records_ticket_created_audit_log():
 
     record = db.scalar(select(ProcessingLog).where(ProcessingLog.finding_id == 100))
     assert record is not None
-    assert record.status == ProcessingStatus.SENT
+    assert record.status == ProcessingStatus.PENDING
     assert record.ticket_status == "DRY_RUN"
     assert record.processed_at is not None
     assert record.dedupe_key is not None
@@ -86,10 +111,61 @@ def test_process_finding_api_dry_run_records_ticket_created_audit_log():
     assert len(fake_manageengine.created_payloads) == 1
 
 
+def test_process_finding_api_unknown_response_is_failed():
+    db = build_session()
+    processor = FindingProcessor(build_settings(), db)
+    processor.manageengine_client = FakeManageEngineClient(
+        status="UNKNOWN",
+        request_id=None,
+    )
+
+    processor.process_finding(build_finding(101))
+
+    record = db.scalar(select(ProcessingLog).where(ProcessingLog.finding_id == 101))
+    assert record is not None
+    assert record.status == ProcessingStatus.FAILED
+    assert "not confirmed" in record.error_message
+
+
+def test_dedupe_claim_blocks_concurrent_worker_and_logical_duplicate():
+    db = build_session()
+    claims = DedupeClaimRepository(db)
+
+    assert claims.acquire(
+        dedupe_key="dd:claim",
+        finding_id=100,
+        worker_id="worker-a",
+        lease_seconds=300,
+    ) == ClaimResult.ACQUIRED
+    assert claims.acquire(
+        dedupe_key="dd:claim",
+        finding_id=100,
+        worker_id="worker-b",
+        lease_seconds=300,
+    ) == ClaimResult.BUSY
+
+    claims.release(dedupe_key="dd:claim", worker_id="worker-a")
+    db.add(
+        ProcessingLog(
+            finding_id=100,
+            dedupe_key="dd:claim",
+            status=ProcessingStatus.SENT,
+        )
+    )
+    db.commit()
+
+    assert claims.acquire(
+        dedupe_key="dd:claim",
+        finding_id=200,
+        worker_id="worker-b",
+        lease_seconds=300,
+    ) == ClaimResult.DUPLICATE
+
+
 def test_process_finding_skips_duplicate_dedupe_key_after_ticket_created():
     db = build_session()
     processor = FindingProcessor(build_settings(), db)
-    fake_manageengine = FakeManageEngineClient()
+    fake_manageengine = FakeManageEngineClient(status="success", request_id="1001")
     processor.manageengine_client = fake_manageengine
 
     processor.process_finding(build_finding(100))
@@ -110,9 +186,8 @@ def test_email_payload_uses_project_mapping_routing_fields():
     mapping = {
         "projects": [
             {
-                "project_name": "Customer Portal Security",
                 "product_name": "Customer Portal",
-                "email_destinations": ["appsec-ticket@example.com"],
+                "ticket_mailbox": "appsec-ticket@example.com",
                 "cc_destinations": [
                     "customer-portal-team@example.com",
                     "appsec-ticket@example.com",
@@ -127,7 +202,6 @@ def test_email_payload_uses_project_mapping_routing_fields():
     processor = FindingProcessor(
         build_settings(
             MANAGEENGINE_DELIVERY_MODE="email_fetch",
-            MANAGEENGINE_ENABLED=False,
             PROJECT_EMAIL_MAPPING_JSON=json.dumps(mapping),
         ),
         db,
@@ -135,7 +209,8 @@ def test_email_payload_uses_project_mapping_routing_fields():
     finding = build_finding(100)
 
     project_mapping = processor._resolve_project_mapping(finding)
-    recipient = processor._resolve_recipient(finding, project_mapping)
+    recipient = processor._resolve_ticket_mailbox(finding, project_mapping)
+    assert recipient is not None
     cc_recipients = processor._resolve_cc_recipients(project_mapping, recipient)
     payload = processor._build_email_payload(
         finding=finding,
@@ -171,12 +246,14 @@ class RecordingRateLimiter:
     def __init__(self):
         self.sent_events = []
 
+    def quota_available(self):
+        return True
+
     def record_send(
         self,
         *,
         finding_id,
         recipient_email,
-        to_emails=None,
         cc_emails=None,
         flow_type=None,
         delivery_mode=None,
@@ -185,7 +262,6 @@ class RecordingRateLimiter:
             {
                 "finding_id": finding_id,
                 "recipient_email": recipient_email,
-                "to_emails": to_emails,
                 "cc_emails": cc_emails,
                 "flow_type": flow_type,
                 "delivery_mode": delivery_mode,
@@ -231,21 +307,17 @@ def test_send_with_retry_records_one_explicit_mail_flow():
     assert [str(email) for email in ticket_email.to_emails] == ["team@example.com"]
     assert [str(email) for email in ticket_email.cc_emails] == ["lead@example.com"]
     assert processor.processing_logs.sent_payload["recipient_email"] == "ticket@example.com"
-    assert processor.processing_logs.sent_payload["to_emails"] == (
-        "ticket@example.com,team@example.com"
-    )
-    assert processor.processing_logs.sent_payload["cc_emails"] == "lead@example.com"
     assert processor.rate_limiter.sent_events[0]["flow_type"] == "ticket_email"
-    assert processor.rate_limiter.sent_events[0]["to_emails"] == (
-        "ticket@example.com,team@example.com"
+    assert processor.rate_limiter.sent_events[0]["recipient_email"] == (
+        "ticket@example.com"
     )
+    assert processor.rate_limiter.sent_events[0]["cc_emails"] == "lead@example.com"
 
 
-def test_email_fetch_sends_ticket_mail_and_notify_mail_separately():
+def test_email_fetch_sends_ticket_mail_and_one_notify_mail_per_recipient():
     mapping = {
         "projects": [
             {
-                "project_name": "Customer Portal Security",
                 "product_name": "Customer Portal",
                 "ticket_mailbox": "appsec-ticket@example.com",
                 "to_destinations": [
@@ -260,7 +332,6 @@ def test_email_fetch_sends_ticket_mail_and_notify_mail_separately():
     processor = FindingProcessor(
         build_settings(
             MANAGEENGINE_DELIVERY_MODE="email_fetch",
-            MANAGEENGINE_ENABLED=False,
             PROJECT_EMAIL_MAPPING_JSON=json.dumps(mapping),
         ),
         db,
@@ -269,54 +340,51 @@ def test_email_fetch_sends_ticket_mail_and_notify_mail_separately():
 
     processor.process_finding(build_finding(300))
 
-    assert len(processor.smtp_client.sent_payloads) == 2
+    assert len(processor.smtp_client.sent_payloads) == 3
     ticket_payload = processor.smtp_client.sent_payloads[0]
-    notify_payload = processor.smtp_client.sent_payloads[1]
+    first_notify_payload = processor.smtp_client.sent_payloads[1]
+    second_notify_payload = processor.smtp_client.sent_payloads[2]
     assert str(ticket_payload.recipient_email) == "appsec-ticket@example.com"
     assert ticket_payload.to_emails == []
     assert ticket_payload.cc_emails == []
-    assert str(notify_payload.recipient_email) == "customer-portal-team@example.com"
-    assert [str(email) for email in notify_payload.to_emails] == [
-        "security-lead@example.com",
+    assert str(first_notify_payload.recipient_email) == "customer-portal-team@example.com"
+    assert first_notify_payload.to_emails == []
+    assert [str(email) for email in first_notify_payload.cc_emails] == [
+        "devsecops@example.com"
     ]
-    assert [str(email) for email in notify_payload.cc_emails] == ["devsecops@example.com"]
-
-    assert [str(email) for email in [notify_payload.recipient_email, *notify_payload.to_emails]] == [
-        "customer-portal-team@example.com",
-        "security-lead@example.com",
+    assert str(second_notify_payload.recipient_email) == "security-lead@example.com"
+    assert second_notify_payload.to_emails == []
+    assert [str(email) for email in second_notify_payload.cc_emails] == [
+        "devsecops@example.com"
     ]
 
     record = db.scalar(select(ProcessingLog).where(ProcessingLog.finding_id == 300))
     assert record is not None
     assert record.status == ProcessingStatus.SENT
     assert record.recipient_email == "appsec-ticket@example.com"
-    assert record.to_emails == "appsec-ticket@example.com"
-    assert record.cc_emails is None
 
     events = list(
         db.scalars(
             select(SmtpSendEvent).where(SmtpSendEvent.finding_id == 300).order_by(SmtpSendEvent.id)
         )
     )
-    assert len(events) == 2
+    assert len(events) == 3
     assert events[0].recipient_email == "appsec-ticket@example.com"
-    assert events[0].to_emails == "appsec-ticket@example.com"
     assert events[0].cc_emails is None
     assert events[0].flow_type == "ticket_email"
     assert events[1].recipient_email == "customer-portal-team@example.com"
-    assert events[1].to_emails == (
-        "customer-portal-team@example.com,security-lead@example.com"
-    )
     assert events[1].cc_emails == "devsecops@example.com"
     assert events[1].flow_type == "notify_email"
+    assert events[2].recipient_email == "security-lead@example.com"
+    assert events[2].cc_emails == "devsecops@example.com"
+    assert events[2].flow_type == "notify_email"
     assert {event.delivery_mode for event in events} == {"email_fetch"}
 
 
-def test_api_mode_creates_manageengine_ticket_then_sends_one_notify_email():
+def test_api_mode_creates_ticket_then_sends_one_notify_mail_per_recipient():
     mapping = {
         "projects": [
             {
-                "project_name": "Customer Portal Security",
                 "product_name": "Customer Portal",
                 "ticket_mailbox": "appsec-ticket@example.com",
                 "to_destinations": [
@@ -331,34 +399,139 @@ def test_api_mode_creates_manageengine_ticket_then_sends_one_notify_email():
     processor = FindingProcessor(
         build_settings(
             MANAGEENGINE_DELIVERY_MODE="api",
-            MANAGEENGINE_ENABLED=True,
             PROJECT_EMAIL_MAPPING_JSON=json.dumps(mapping),
         ),
         db,
     )
-    fake_manageengine = FakeManageEngineClient()
+    fake_manageengine = FakeManageEngineClient(status="success", request_id="1002")
     processor.manageengine_client = fake_manageengine
     processor.smtp_client = RecordingSmtpClient()
 
     processor.process_finding(build_finding(301))
 
     assert len(fake_manageengine.created_payloads) == 1
-    assert len(processor.smtp_client.sent_payloads) == 1
-    payload = processor.smtp_client.sent_payloads[0]
-    assert str(payload.recipient_email) == "customer-portal-team@example.com"
-    assert [str(email) for email in payload.to_emails] == ["security-lead@example.com"]
-    assert [str(email) for email in payload.cc_emails] == ["devsecops@example.com"]
+    assert len(processor.smtp_client.sent_payloads) == 2
+    first_payload = processor.smtp_client.sent_payloads[0]
+    second_payload = processor.smtp_client.sent_payloads[1]
+    assert str(first_payload.recipient_email) == "customer-portal-team@example.com"
+    assert first_payload.to_emails == []
+    assert [str(email) for email in first_payload.cc_emails] == [
+        "devsecops@example.com"
+    ]
+    assert str(second_payload.recipient_email) == "security-lead@example.com"
+    assert second_payload.to_emails == []
+    assert [str(email) for email in second_payload.cc_emails] == [
+        "devsecops@example.com"
+    ]
 
     events = list(
         db.scalars(
             select(SmtpSendEvent).where(SmtpSendEvent.finding_id == 301).order_by(SmtpSendEvent.id)
         )
     )
-    assert len(events) == 1
+    assert len(events) == 2
     assert events[0].recipient_email == "customer-portal-team@example.com"
-    assert events[0].to_emails == (
-        "customer-portal-team@example.com,security-lead@example.com"
-    )
     assert events[0].cc_emails == "devsecops@example.com"
     assert events[0].flow_type == "notify_email"
     assert events[0].delivery_mode == "api"
+    assert events[1].recipient_email == "security-lead@example.com"
+    assert events[1].cc_emails == "devsecops@example.com"
+    assert events[1].flow_type == "notify_email"
+    assert events[1].delivery_mode == "api"
+
+
+def test_rate_limited_ticket_retry_sends_notifications_after_success():
+    mapping = {
+        "projects": [
+            {
+                "product_name": "Customer Portal",
+                "ticket_mailbox": "appsec-ticket@example.com",
+                "to_destinations": [
+                    "customer-portal-team@example.com",
+                    "security-lead@example.com",
+                ],
+                "cc_destinations": ["devsecops@example.com"],
+            }
+        ]
+    }
+    db = build_session()
+    processor = FindingProcessor(
+        build_settings(
+            MANAGEENGINE_DELIVERY_MODE="email_fetch",
+            PROJECT_EMAIL_MAPPING_JSON=json.dumps(mapping),
+            SMTP_MAX_EMAILS_PER_MINUTE=0,
+        ),
+        db,
+    )
+    finding = build_finding(302)
+    processor.smtp_client = RecordingSmtpClient()
+    processor.process_finding(finding)
+
+    queued = db.scalar(
+        select(ProcessingLog).where(ProcessingLog.finding_id == finding.finding_id)
+    )
+    assert queued is not None
+    assert queued.status == ProcessingStatus.RATE_LIMITED
+    queued.next_attempt_at = None
+    db.commit()
+    processor.rate_limiter.max_per_minute = 30
+
+    processor.process_rate_limited_queue()
+
+    assert len(processor.smtp_client.sent_payloads) == 3
+    assert str(processor.smtp_client.sent_payloads[0].recipient_email) == (
+        "appsec-ticket@example.com"
+    )
+    assert str(processor.smtp_client.sent_payloads[1].recipient_email) == (
+        "customer-portal-team@example.com"
+    )
+    assert str(processor.smtp_client.sent_payloads[2].recipient_email) == (
+        "security-lead@example.com"
+    )
+    record = db.scalar(
+        select(ProcessingLog).where(ProcessingLog.finding_id == finding.finding_id)
+    )
+    assert record is not None
+    assert record.status == ProcessingStatus.SENT
+
+
+class TransientFailingSmtpClient:
+    def send(self, payload):
+        raise TimeoutError("temporary SMTP timeout")
+
+
+def test_notification_failure_is_persisted_for_later_retry():
+    mapping = {
+        "projects": [
+            {
+                "product_name": "Customer Portal",
+                "to_destinations": ["security-team@example.com"],
+            }
+        ]
+    }
+    db = build_session()
+    processor = FindingProcessor(
+        build_settings(
+            MANAGEENGINE_DELIVERY_MODE="api",
+            PROJECT_EMAIL_MAPPING_JSON=json.dumps(mapping),
+        ),
+        db,
+    )
+    processor.manageengine_client = FakeManageEngineClient(
+        status="success",
+        request_id="2001",
+    )
+    processor.smtp_client = TransientFailingSmtpClient()
+
+    processor.process_finding(build_finding(303))
+
+    delivery = db.scalar(
+        select(NotificationDelivery).where(
+            NotificationDelivery.finding_id == 303
+        )
+    )
+    assert delivery is not None
+    assert delivery.status == NotificationStatus.RETRY_PENDING
+    assert delivery.retry_count == 1
+    assert delivery.next_attempt_at is not None
+    assert "temporary SMTP timeout" in delivery.error_message

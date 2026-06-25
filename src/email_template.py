@@ -1,3 +1,5 @@
+"""Build safe plain-text and HTML ticket content for different finding types."""
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html import escape
@@ -14,6 +16,8 @@ SUPPORT_TEAM_NAME = "DevSecOps Team"
 
 @dataclass(frozen=True)
 class TicketContent:
+    """Rendered ticket content and routing metadata shared by both modes."""
+
     finding_id: int
     subject: str
     body: str
@@ -29,6 +33,7 @@ class TicketContent:
 
 
 def build_subject(finding: DefectDojoFinding) -> str:
+    """Build a redacted email subject capped at the configured length."""
     project_name = redact_secrets(finding.product or "Unknown Project")
     title = _redact_contextual_text(finding, finding.title)
     subject = (
@@ -51,6 +56,7 @@ def build_ticket_content(
     subcategory: str | None = None,
     generated_at: datetime | None = None,
 ) -> TicketContent:
+    """Render both text and HTML content plus ticket metadata."""
     generated_at = generated_at or datetime.now(timezone.utc)
     priority = sla_policy.priority if sla_policy else "N/A"
     sla_target = sla_policy.target if sla_policy else "N/A"
@@ -110,6 +116,7 @@ def build_body(
     subcategory: str | None = None,
     generated_at: datetime | None = None,
 ) -> str:
+    """Render the plain-text finding notification body."""
     generated_at = generated_at or datetime.now(timezone.utc)
     project_name = redact_secrets(finding.product or "N/A")
     impact = _redact_contextual_text(
@@ -193,6 +200,7 @@ def build_html_body(
     subcategory: str | None = None,
     generated_at: datetime | None = None,
 ) -> str:
+    """Render an escaped HTML alternative with clickable links."""
     generated_at = generated_at or datetime.now(timezone.utc)
     project_name = redact_secrets(finding.product or "N/A")
     impact = _redact_contextual_text(
@@ -263,12 +271,14 @@ def build_html_body(
 
 
 def _build_finding_url(defectdojo_base_url: str | None, finding_id: int) -> str:
+    """Build a direct DefectDojo finding URL when a base URL is available."""
     if not defectdojo_base_url:
         return "N/A"
     return f"{defectdojo_base_url.rstrip('/')}/finding/{finding_id}"
 
 
 def _build_manageengine_url(manageengine_public_url: str | None) -> str:
+    """Build the ManageEngine request-list URL available before ticket creation."""
     if not manageengine_public_url:
         return "N/A"
     # In email_fetch mode the backend sends this email before ManageEngine
@@ -277,25 +287,21 @@ def _build_manageengine_url(manageengine_public_url: str | None) -> str:
 
 
 def _truncate_text(value: str, max_length: int) -> str:
+    """Truncate text and reserve space for the configured ellipsis."""
     if len(value) <= max_length:
         return value
     return value[: max_length - len(EMAIL_SUBJECT_ELLIPSIS)] + EMAIL_SUBJECT_ELLIPSIS
 
 
-def _format_generated_at(value: datetime) -> str:
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    value = value.astimezone(timezone.utc)
-    return value.strftime("%Y-%m-%d %H:%M:%S UTC")
-
-
 def _format_component(finding: DefectDojoFinding) -> str:
+    """Combine dependency component name and version for display."""
     if finding.component_name and finding.component_version:
         return f"{finding.component_name}:{finding.component_version}"
     return finding.component_name or finding.component_version or "N/A"
 
 
 def _build_finding_detail_fields(finding: DefectDojoFinding) -> list[tuple[str, str]]:
+    """Build non-empty detail fields for the detected template type."""
     template_name = _select_detail_template(finding)
     project_name = redact_secrets(finding.product or "N/A")
     base_fields = [
@@ -341,6 +347,7 @@ def _build_finding_detail_fields(finding: DefectDojoFinding) -> list[tuple[str, 
 
 
 def _select_detail_template(finding: DefectDojoFinding) -> str:
+    """Select cloud, DAST, dependency, or SAST field layout."""
     if _looks_like_cloud_finding(finding):
         return "cloud"
     if _has_value(finding.endpoint) or _has_value(finding.parameter):
@@ -357,6 +364,7 @@ def _select_detail_template(finding: DefectDojoFinding) -> str:
 
 
 def _looks_like_cloud_finding(finding: DefectDojoFinding) -> bool:
+    """Detect cloud findings from scanner, text, component, and resource fields."""
     scanner = (finding.scanner_type or "").lower()
     cloud_text = " ".join(
         value
@@ -392,6 +400,7 @@ def _looks_like_cloud_finding(finding: DefectDojoFinding) -> bool:
 
 
 def _extract_cloud_fields(finding: DefectDojoFinding) -> dict[str, str | None]:
+    """Extract investigation-safe Cloud and Security Hub details."""
     text = "\n".join(
         value
         for value in (finding.impact, finding.description, finding.mitigation)
@@ -430,6 +439,7 @@ def _extract_cloud_fields(finding: DefectDojoFinding) -> dict[str, str | None]:
 
 
 def _extract_labeled_value(text: str, labels: tuple[str, ...]) -> str | None:
+    """Find the first line matching one of the supplied field labels."""
     for label in labels:
         pattern = rf"(?im)^\s*(?:[-*]\s*)?{re.escape(label)}\s*:\s*(.+?)\s*$"
         match = re.search(pattern, text)
@@ -439,6 +449,7 @@ def _extract_labeled_value(text: str, labels: tuple[str, ...]) -> str | None:
 
 
 def _extract_securityhub_finding_arn(value: str) -> str | None:
+    """Extract a Security Hub finding ARN from arbitrary text."""
     match = re.search(
         r"\barn:aws[a-zA-Z-]*:securityhub:[^\s]+/finding/[^\s,;<>]+",
         value,
@@ -449,6 +460,7 @@ def _extract_securityhub_finding_arn(value: str) -> str | None:
 
 
 def _parse_securityhub_finding_arn(value: str) -> dict[str, str] | None:
+    """Parse safe control metadata from a supported Security Hub ARN."""
     match = re.match(
         r"^arn:aws[a-zA-Z-]*:securityhub:"
         r"(?P<region>[^:]+):"
@@ -471,6 +483,7 @@ def _parse_securityhub_finding_arn(value: str) -> dict[str, str] | None:
 
 
 def _format_security_standard(value: str) -> str:
+    """Convert a Security Hub standard path to a readable label."""
     parts = [part for part in value.split("/") if part]
     if not parts:
         return value
@@ -485,17 +498,20 @@ def _format_security_standard(value: str) -> str:
 
 
 def _format_standard_word(value: str) -> str:
+    """Preserve known security acronyms while title-casing other words."""
     acronyms = {"aws": "AWS", "cis": "CIS", "nist": "NIST", "pci": "PCI"}
     return acronyms.get(value.lower(), value.capitalize())
 
 
 def _short_reference(value: str) -> str:
+    """Shorten long finding references while retaining both ends."""
     if len(value) <= 16:
         return value
     return f"{value[:8]}...{value[-4:]}"
 
 
 def _redact_cloud_identifier(value: object) -> str | None:
+    """Mask account IDs and summarize Security Hub ARNs in cloud values."""
     if not _has_value(value):
         return None
     text = _redact_securityhub_finding_arns(redact_secrets(str(value)))
@@ -503,6 +519,7 @@ def _redact_cloud_identifier(value: object) -> str | None:
 
 
 def _redact_contextual_text(finding: DefectDojoFinding, value: object) -> str:
+    """Apply cloud-aware redaction or generic credential masking."""
     if not _has_value(value):
         return "N/A"
     if _looks_like_cloud_finding(finding):
@@ -511,11 +528,13 @@ def _redact_contextual_text(finding: DefectDojoFinding, value: object) -> str:
 
 
 def _redact_securityhub_finding_arns(value: str) -> str:
+    """Replace full Security Hub ARNs with control and short-reference text."""
     pattern = re.compile(
         r"\barn:aws[a-zA-Z-]*:securityhub:[^\s]+/finding/[^\s,;<>]+"
     )
 
     def replace(match: re.Match[str]) -> str:
+        """Render one matched ARN as safe operational metadata."""
         parsed = _parse_securityhub_finding_arn(match.group(0).strip().rstrip("."))
         if not parsed:
             return MASK
@@ -528,6 +547,7 @@ def _redact_securityhub_finding_arns(value: str) -> str:
 
 
 def _compact_fields(fields: list[tuple[str, object]]) -> list[tuple[str, str]]:
+    """Remove empty fields and redact remaining display values."""
     compacted: list[tuple[str, str]] = []
     for label, value in fields:
         if not _has_value(value):
@@ -537,6 +557,7 @@ def _compact_fields(fields: list[tuple[str, object]]) -> list[tuple[str, str]]:
 
 
 def _has_value(value: object) -> bool:
+    """Return whether a value contains meaningful display data."""
     if value is None:
         return False
     if isinstance(value, str):
@@ -548,10 +569,12 @@ def _has_value(value: object) -> bool:
 
 
 def _format_fields(fields: list[tuple[str, str]]) -> str:
+    """Format key-value fields as a plain-text bullet list."""
     return "\n".join(f"- {label}: {value}" for label, value in fields)
 
 
 def _format_html_fields(fields: list[tuple[str, str]]) -> str:
+    """Format escaped key-value fields as an HTML list."""
     items = "\n".join(
         f"<li>{escape(label)}: {escape(str(value))}</li>"
         for label, value in fields
@@ -560,6 +583,7 @@ def _format_html_fields(fields: list[tuple[str, str]]) -> str:
 
 
 def _format_paragraph(value: str) -> str:
+    """Normalize Markdown-like text into wrapped plain-text paragraphs."""
     if value == "N/A":
         return value
     paragraphs = [
@@ -573,6 +597,7 @@ def _format_paragraph(value: str) -> str:
 
 
 def _format_html_paragraph(value: str) -> str:
+    """Normalize and escape text into separate HTML paragraphs."""
     if value == "N/A":
         return "<p>N/A</p>"
     paragraphs = [
@@ -586,10 +611,12 @@ def _format_html_paragraph(value: str) -> str:
 
 
 def _strip_markdown_emphasis(value: str) -> str:
+    """Remove bold emphasis markers unsupported by the target display."""
     return value.replace("**", "")
 
 
 def _format_html_link(url: str, label: str) -> str:
+    """Return an escaped clickable link or N/A when no URL exists."""
     if url == "N/A":
         return "N/A"
     escaped_url = escape(url, quote=True)

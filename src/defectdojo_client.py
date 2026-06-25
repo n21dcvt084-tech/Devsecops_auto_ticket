@@ -1,3 +1,5 @@
+"""Fetch and normalize active, verified findings from the DefectDojo API."""
+
 import logging
 from urllib.parse import urljoin
 
@@ -10,13 +12,17 @@ logger = logging.getLogger(__name__)
 
 
 class DefectDojoClient:
+    """HTTP client with pagination and product-resolution caches."""
+
     def __init__(self, settings: Settings):
+        """Store settings and initialize relationship lookup caches."""
         self.settings = settings
         self._test_cache: dict[int, dict] = {}
         self._engagement_cache: dict[int, dict] = {}
         self._product_cache: dict[int, dict] = {}
 
     def fetch_active_verified_findings(self) -> list[DefectDojoFinding]:
+        """Fetch every active and verified finding across API pages."""
         findings: list[DefectDojoFinding] = []
         limit = self.settings.defectdojo_findings_limit
         offset = 0
@@ -68,18 +74,22 @@ class DefectDojoClient:
         return findings
 
     def _headers(self) -> dict[str, str]:
+        """Build DefectDojo token-authentication headers."""
         return {
             "Authorization": f"Token {self.settings.defectdojo_api_token}",
             "Accept": "application/json",
         }
 
     def _findings_url(self) -> str:
+        """Return the canonical findings endpoint."""
         return urljoin(self.settings.defectdojo_base_url + "/", "api/v2/findings/")
 
     def _api_url(self, path: str) -> str:
+        """Join an API-relative path to the configured DefectDojo base URL."""
         return urljoin(self.settings.defectdojo_base_url + "/", path.lstrip("/"))
 
     def _get_json(self, path: str) -> dict:
+        """GET one DefectDojo resource and return its decoded JSON object."""
         response = requests.get(
             self._api_url(path),
             headers=self._headers(),
@@ -89,6 +99,7 @@ class DefectDojoClient:
         return response.json()
 
     def _map_finding(self, raw: dict) -> DefectDojoFinding:
+        """Convert one raw DefectDojo result into the internal finding schema."""
         endpoints = self._extract_endpoint_values(raw.get("endpoints") or [])
 
         product_name = self._resolve_product_name(raw)
@@ -127,6 +138,7 @@ class DefectDojoClient:
         )
 
     def _extract_endpoint_values(self, raw_endpoints: list) -> list[str]:
+        """Normalize supported endpoint objects and strings into display values."""
         endpoints: list[str] = []
         for endpoint in raw_endpoints:
             if isinstance(endpoint, dict):
@@ -147,6 +159,7 @@ class DefectDojoClient:
         return endpoints
 
     def _resolve_product_name(self, raw: dict) -> str | None:
+        """Resolve product name directly or through test and engagement links."""
         product = raw.get("product")
         if isinstance(product, dict) and product.get("name"):
             return product["name"]
@@ -175,6 +188,7 @@ class DefectDojoClient:
             return None
 
     def _extract_id(self, value: object) -> int | None:
+        """Extract an integer ID from an API integer or object reference."""
         if isinstance(value, int):
             return value
         if isinstance(value, dict) and isinstance(value.get("id"), int):
@@ -182,11 +196,13 @@ class DefectDojoClient:
         return None
 
     def _get_test(self, test_id: int) -> dict:
+        """Return a cached DefectDojo test resource."""
         if test_id not in self._test_cache:
             self._test_cache[test_id] = self._get_json(f"api/v2/tests/{test_id}/")
         return self._test_cache[test_id]
 
     def _get_engagement(self, engagement_id: int) -> dict:
+        """Return a cached DefectDojo engagement resource."""
         if engagement_id not in self._engagement_cache:
             self._engagement_cache[engagement_id] = self._get_json(
                 f"api/v2/engagements/{engagement_id}/"
@@ -194,22 +210,26 @@ class DefectDojoClient:
         return self._engagement_cache[engagement_id]
 
     def _get_product_name(self, product_id: int) -> str | None:
+        """Resolve and cache a DefectDojo product name by ID."""
         if product_id not in self._product_cache:
             self._product_cache[product_id] = self._get_json(f"api/v2/products/{product_id}/")
         return self._product_cache[product_id].get("name")
 
     def _string_or_none(self, value: object) -> str | None:
+        """Convert a non-empty API value to string."""
         if value in (None, ""):
             return None
         return str(value)
 
     def _int_or_none(self, value: object) -> int | None:
+        """Convert a non-empty API value to integer when possible."""
         try:
             return int(value) if value not in (None, "") else None
         except (TypeError, ValueError):
             return None
 
     def _first_value(self, value: object) -> str | None:
+        """Extract the first useful identifier from list, dict, or scalar values."""
         if isinstance(value, list):
             if not value:
                 return None

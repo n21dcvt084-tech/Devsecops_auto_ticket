@@ -1,3 +1,5 @@
+"""Load and validate application settings from environment variables."""
+
 from functools import lru_cache
 from typing import Any
 
@@ -6,16 +8,16 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 SMTP_SUBMISSION_PORT = 587
-IMAP_SSL_PORT = 993
-IMAP_DEFAULT_HOST = "outlook.office365.com"
 
 
 class Settings(BaseSettings):
+    """Typed configuration shared by the scheduler, clients, and processor."""
+
     defectdojo_base_url: str = Field(..., alias="DEFECTDOJO_BASE_URL")
     defectdojo_api_token: str = Field(..., alias="DEFECTDOJO_API_TOKEN")
     defectdojo_findings_limit: int = Field(100, alias="DEFECTDOJO_FINDINGS_LIMIT")
     defectdojo_request_timeout_seconds: int = Field(
-        30, alias="DEFECTDOJO_REQUEST_TIMEOUT_SECONDS"
+        60, alias="DEFECTDOJO_REQUEST_TIMEOUT_SECONDS"
     )
 
     project_email_mapping_json: str | None = Field(
@@ -27,23 +29,17 @@ class Settings(BaseSettings):
 
     database_url: str = Field(..., alias="DATABASE_URL")
 
-    # This MVP sends alert emails via SMTP. IMAP SSL 993 is documented for
-    # future mailbox-reading workflows and is not used by the current sender.
     smtp_host: str = Field(..., alias="SMTP_HOST")
     smtp_port: int = Field(SMTP_SUBMISSION_PORT, alias="SMTP_PORT")
-    imap_ssl_port: int = Field(IMAP_SSL_PORT, alias="IMAP_SSL_PORT")
-    imap_host: str = Field(IMAP_DEFAULT_HOST, alias="IMAP_HOST")
-    imap_username: str | None = Field(None, alias="IMAP_USERNAME")
-    imap_password: str | None = Field(None, alias="IMAP_PASSWORD")
-    imap_timeout_seconds: int = Field(30, alias="IMAP_TIMEOUT_SECONDS")
     smtp_username: str | None = Field(None, alias="SMTP_USERNAME")
     smtp_password: str | None = Field(None, alias="SMTP_PASSWORD")
     smtp_from_email: str = Field(..., alias="SMTP_FROM_EMAIL")
     smtp_use_tls: bool = Field(True, alias="SMTP_USE_TLS")
     smtp_timeout_seconds: int = Field(30, alias="SMTP_TIMEOUT_SECONDS")
-    smtp_pool_size: int = Field(5, alias="SMTP_POOL_SIZE")
-
     scheduler_interval_seconds: int = Field(300, alias="SCHEDULER_INTERVAL_SECONDS")
+    processing_claim_ttl_seconds: int = Field(
+        1800, alias="PROCESSING_CLAIM_TTL_SECONDS"
+    )
 
     smtp_max_emails_per_minute: int = Field(30, alias="SMTP_MAX_EMAILS_PER_MINUTE")
     smtp_max_emails_per_hour: int = Field(500, alias="SMTP_MAX_EMAILS_PER_HOUR")
@@ -54,7 +50,6 @@ class Settings(BaseSettings):
         2, alias="SMTP_RETRY_BACKOFF_MULTIPLIER"
     )
 
-    manageengine_enabled: bool = Field(False, alias="MANAGEENGINE_ENABLED")
     manageengine_delivery_mode: str = Field(
         "email_fetch", alias="MANAGEENGINE_DELIVERY_MODE"
     )
@@ -92,11 +87,13 @@ class Settings(BaseSettings):
     @field_validator("defectdojo_base_url")
     @classmethod
     def strip_trailing_slash(cls, value: str) -> str:
+        """Normalize the DefectDojo base URL for safe URL joining."""
         return value.rstrip("/")
 
     @field_validator("manageengine_base_url")
     @classmethod
     def strip_manageengine_trailing_slash(cls, value: str | None) -> str | None:
+        """Normalize the internal ManageEngine base URL when configured."""
         if value is None:
             return None
         return value.rstrip("/")
@@ -104,6 +101,7 @@ class Settings(BaseSettings):
     @field_validator("manageengine_public_url")
     @classmethod
     def strip_manageengine_public_trailing_slash(cls, value: str | None) -> str | None:
+        """Normalize the public ManageEngine URL rendered in email content."""
         if value is None:
             return None
         return value.rstrip("/")
@@ -111,6 +109,7 @@ class Settings(BaseSettings):
     @field_validator("manageengine_delivery_mode")
     @classmethod
     def validate_manageengine_delivery_mode(cls, value: str) -> str:
+        """Accept only the supported email-fetch and direct-API modes."""
         normalized = value.strip().lower()
         allowed_modes = {"email_fetch", "api"}
         if normalized not in allowed_modes:
@@ -122,6 +121,7 @@ class Settings(BaseSettings):
     @field_validator("project_email_mapping_json", mode="before")
     @classmethod
     def empty_string_to_none(cls, value: Any) -> Any:
+        """Treat an empty inline mapping value as an unset configuration."""
         if value == "":
             return None
         return value
@@ -129,4 +129,5 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
+    """Return one cached Settings instance for the running process."""
     return Settings()

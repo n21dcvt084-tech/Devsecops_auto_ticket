@@ -1,3 +1,5 @@
+"""Mask likely credentials before content is logged, emailed, or ticketed."""
+
 import re
 
 MASK = "XXXXXX"

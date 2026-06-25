@@ -8,7 +8,7 @@ from email_template import build_ticket_content
 from manageengine_mapper import build_manageengine_payload, map_manageengine_priority
 from processor import FindingProcessor, missing_ticket_fields
 from schemas import DefectDojoFinding, EmailPayload, TicketAction
-from sla import policy_for_severity
+from manageengine_mapper import policy_for_severity
 
 
 def build_settings(**overrides):
@@ -20,7 +20,6 @@ def build_settings(**overrides):
         "SMTP_FROM_EMAIL": "devsecops@example.com",
         "MANAGEENGINE_REQUESTER_NAME": "DevSecOps Automation",
         "MANAGEENGINE_DELIVERY_MODE": "email_fetch",
-        "MANAGEENGINE_ENABLED": False,
         "MANAGEENGINE_DEFAULT_GROUP": "DevSecOps",
         "MANAGEENGINE_DEFAULT_CATEGORY": "Security",
         "MANAGEENGINE_DEFAULT_SUBCATEGORY": "Vulnerability",
@@ -108,21 +107,33 @@ def test_mapper_converts_internal_sla_priority_to_manageengine_priority_name():
     assert map_manageengine_priority("P4/Low") == "Low"
 
 
+def test_critical_maps_to_p1_7_days():
+    policy = policy_for_severity("Critical")
+
+    assert policy.priority == "P1/Critical"
+    assert policy.target == "7 days"
+    assert policy.due_at is not None
+
+
+def test_low_maps_to_p4_60_to_90_days():
+    policy = policy_for_severity("Low")
+
+    assert policy.priority == "P4/Low"
+    assert policy.target == "60 - 90 days"
+
+
 def test_manageengine_delivery_mode_defaults_to_email_fetch():
     settings = build_settings()
 
     assert settings.manageengine_delivery_mode == "email_fetch"
-    assert settings.manageengine_enabled is False
 
 
 def test_manageengine_delivery_mode_accepts_api():
     settings = build_settings(
         MANAGEENGINE_DELIVERY_MODE="api",
-        MANAGEENGINE_ENABLED=True,
     )
 
     assert settings.manageengine_delivery_mode == "api"
-    assert settings.manageengine_enabled is True
 
 
 def processor_without_init():
@@ -135,6 +146,9 @@ class FailingSmtpClient:
 
 
 class NoopRateLimiter:
+    def quota_available(self):
+        return True
+
     def record_send(self, *, finding_id, recipient_email):
         raise AssertionError("record_send should not run after SMTP failure")
 
@@ -164,8 +178,6 @@ def test_missing_ticket_fields_reports_optional_defectdojo_gaps():
     )
 
     assert missing_ticket_fields(finding) == [
-        "endpoint",
-        "date",
         "impact_or_description",
         "mitigation",
     ]
@@ -187,7 +199,7 @@ def test_processor_logs_missing_finding_fields(caplog):
     record = caplog.records[0]
     assert record.finding_id == 3282
     assert record.dedupe_key == "dd:example"
-    assert record.missing_fields == "endpoint,date,impact_or_description,mitigation"
+    assert record.missing_fields == "impact_or_description,mitigation"
 
 
 def test_send_with_retry_marks_failed_when_smtp_failure_is_not_transient():
@@ -209,6 +221,6 @@ def test_send_with_retry_marks_failed_when_smtp_failure_is_not_transient():
     failed_payload = processor.processing_logs.failed_payload
     assert failed_payload["finding_id"] == 3282
     assert failed_payload["recipient_email"] == "ticket@example.com"
-    assert failed_payload["retry_count"] == 0
+    assert failed_payload["retry_count"] == 1
     assert failed_payload["error_message"] == "bad recipient"
     assert failed_payload["dedupe_key"] == "dd:example"

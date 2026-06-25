@@ -1,3 +1,7 @@
+"""Map finding severity and content to a ManageEngine request payload."""
+
+from datetime import datetime, timedelta, timezone
+
 from config import Settings
 from email_template import build_ticket_content
 from schemas import (
@@ -15,8 +19,34 @@ MANAGEENGINE_PRIORITY_BY_SLA_PRIORITY = {
     "P5/Info": "Low",
 }
 
+SLA_BY_SEVERITY = {
+    "critical": ("P1/Critical", timedelta(days=7), "7 days"),
+    "high": ("P2/High", timedelta(days=14), "14 days"),
+    "medium": ("P3/Medium", timedelta(days=30), "30 days"),
+    "low": ("P4/Low", timedelta(days=90), "60 - 90 days"),
+    "informational": ("P5/Info", None, "Best effort"),
+    "info": ("P5/Info", None, "Best effort"),
+}
+
+
+def policy_for_severity(severity: str) -> SlaPolicy:
+    """Map DefectDojo severity to internal priority, SLA target, and due date."""
+    normalized = severity.strip().lower()
+    priority, delta, target = SLA_BY_SEVERITY.get(
+        normalized,
+        ("P5/Info", None, "Best effort"),
+    )
+    now = datetime.now(timezone.utc)
+    return SlaPolicy(
+        severity=severity,
+        priority=priority,
+        target=target,
+        due_at=now + delta if delta else None,
+    )
+
 
 def map_manageengine_priority(priority: str) -> str:
+    """Translate internal priority labels to ManageEngine priority names."""
     return MANAGEENGINE_PRIORITY_BY_SLA_PRIORITY.get(priority, priority)
 
 
@@ -28,6 +58,7 @@ def build_manageengine_payload(
     sla_policy: SlaPolicy,
     ticket_action: TicketAction,
 ) -> ManageEngineRequestPayload:
+    """Build a validated ManageEngine API payload from one normalized finding."""
     content = build_ticket_content(
         finding,
         settings.defectdojo_base_url,

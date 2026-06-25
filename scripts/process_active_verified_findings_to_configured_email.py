@@ -10,7 +10,7 @@ from sqlalchemy import text
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from config import Settings
-from database import get_session_factory, init_database
+from database import get_session_factory
 from defectdojo_client import DefectDojoClient
 from processor import FindingProcessor
 from schemas import DefectDojoFinding
@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--clear-db",
         action="store_true",
-        help="Truncate processing_logs and smtp_send_events before processing.",
+        help="Truncate local workflow, queue, dedupe, and SMTP audit tables.",
     )
     parser.add_argument(
         "--page-size",
@@ -90,7 +90,18 @@ def require_real_send_confirmation() -> None:
 def clear_database() -> None:
     session_factory = get_session_factory()
     with session_factory() as db:
-        db.execute(text("TRUNCATE TABLE smtp_send_events, processing_logs RESTART IDENTITY"))
+        db.execute(
+            text(
+                """
+                TRUNCATE TABLE
+                    notification_deliveries,
+                    dedupe_claims,
+                    smtp_send_events,
+                    processing_logs
+                RESTART IDENTITY
+                """
+            )
+        )
         db.commit()
 
 
@@ -151,9 +162,6 @@ def main() -> int:
 
     settings = Settings()
     settings.manageengine_delivery_mode = "email_fetch"
-    settings.manageengine_enabled = False
-    init_database()
-
     if args.clear_db:
         clear_database()
 

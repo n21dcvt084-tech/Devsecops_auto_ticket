@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from config import Settings
@@ -77,3 +79,38 @@ def test_format_manageengine_description_preserves_line_breaks_and_escapes_html(
     assert "Finding Details<br>- Endpoint:" in formatted
     assert "<script>" not in formatted
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in formatted
+
+
+class FakeResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self.payload
+
+
+def test_create_request_rejects_http_200_without_confirmed_request(monkeypatch):
+    monkeypatch.setattr(
+        "manageengine_client.requests.post",
+        lambda *args, **kwargs: FakeResponse(
+            {"response_status": {"status": "failed"}}
+        ),
+    )
+    client = ManageEngineClient(
+        build_settings(
+            MANAGEENGINE_DRY_RUN=False,
+            MANAGEENGINE_AUTH_TOKEN="token",
+        )
+    )
+    payload = ManageEngineRequestPayload(
+        finding_id=3282,
+        subject="Security finding",
+        description="Finding details",
+        ticket_action=TicketAction.CREATE,
+    )
+
+    with pytest.raises(ValueError, match="request.id"):
+        client.create_request(payload)
