@@ -1,0 +1,95 @@
+stages:
+  - validate
+  - test
+  - build
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+cache:
+  key: "$CI_COMMIT_REF_SLUG"
+  paths:
+    - .cache/pip/
+
+secret_guard:
+  stage: validate
+  image:
+    name: alpine/git:latest
+    entrypoint: [""]
+  script:
+    - |
+      set -eu
+      forbidden_files="$(git ls-files | grep -E '(^|/)(\.env($|\.)|.*\.(pem|key|p12|pfx|jks|keystore)$|credentials\.json$|service-account.*\.json$|secrets?/)' | grep -vE '(^|/)\.env\.example$' || true)"
+      if [ -n "$forbidden_files" ]; then
+        echo "Blocked: these tracked files look like secrets or private credentials:"
+        echo "$forbidden_files"
+        exit 1
+      fi
+    - |
+      set -eu
+      if git grep -I -n -E '(AKIA[0-9A-Z]{16}|-----BEGIN ([A-Z ]+)?PRIVATE KEY-----|ghp_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|(api[_-]?key|token|secret|password)[[:space:]]*[:=][[:space:]]*['"'"'"][^'"'"'"]{12,})' -- ':!tests/**' ':!*.md' ':!.env.example' ':!.gitlab-ci.yml' > secret-findings.txt; then
+        echo "Blocked: possible hardcoded secret found:"
+        cat secret-findings.txt
+        exit 1
+      fi
+
+unit_tests:
+  stage: test
+  image: python:3.13.13-slim-bookworm
+  before_script:
+    - python --version
+    - python -m pip install --upgrade pip
+    - pip install -r requirements-dev.txt
+  script:
+    - mkdir -p reports
+    - python -m pytest -q --junitxml=reports/pytest.xml
+  artifacts:
+    when: always
+    reports:
+      junit: reports/pytest.xml
+    expire_in: 7 days
+
+docker_build:
+  stage: build
+  image: docker:27.5.1
+  services:
+    - name: docker:27.5.1-dind
+      command: ["--tls=false"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    - docker build --pull -t "$CI_PROJECT_NAME:$CI_COMMIT_SHORT_SHA" .
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+docker_publish:
+  stage: build
+  image: docker:27.5.1
+  services:
+    - name: docker:27.5.1-dind
+      command: ["--tls=false"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  needs:
+    - unit_tests
+    - secret_guard
+  script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - docker build --pull -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG" .
+    - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+    - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG"
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+        docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY_IMAGE:latest"
+        docker push "$CI_REGISTRY_IMAGE:latest"
+      fi
+  rules:
+    - if: '$CI_COMMIT_BRANCH'

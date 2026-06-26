@@ -160,7 +160,7 @@ tests/                      Unit tests
 ## Initial Setup
 
 ```bash
-cd /Users/quyph/Documents/DevSecOps_auto_ticket_v2
+cd /Users/quyph/Documents/Devsecops_auto_ticket
 
 python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
@@ -215,6 +215,58 @@ Current local result:
 
 Unit tests use fake clients and do not require DefectDojo, SMTP, or
 ManageEngine to be running.
+
+## GitLab CI/CD
+
+The repository includes [.gitlab-ci.yml](.gitlab-ci.yml) with these stages:
+
+| Stage | Job | Purpose |
+|---|---|---|
+| `validate` | `secret_guard` | Fails if `.env`, private keys, credential JSON files, or common hardcoded token patterns are tracked |
+| `test` | `unit_tests` | Installs `requirements-dev.txt` and runs `pytest` |
+| `build` | `docker_build` | Builds the Docker image for branches and merge requests |
+| `build` | `docker_publish` | Publishes image tags to GitLab Container Registry for branch pipelines |
+
+Initial GitLab setup:
+
+1. Create the GitLab project without initializing it with a README.
+2. Add your SSH public key in GitLab user settings.
+3. Point the local repository to GitLab:
+
+```bash
+git remote set-url origin git@gitlab.com:n21dcvt084/Devsecops_auto_ticket.git
+git remote -v
+```
+
+4. Confirm secrets are not tracked:
+
+```bash
+git check-ignore -v .env
+git ls-files -- .env
+```
+
+`git ls-files -- .env` must print nothing.
+
+5. Push:
+
+```bash
+git push -u origin main
+```
+
+The Docker jobs use Docker-in-Docker. In GitLab, the runner must allow
+privileged Docker service containers, or the build jobs will fail while
+connecting to the Docker daemon.
+
+Runtime secrets such as DefectDojo tokens, SMTP passwords, ManageEngine API
+tokens, and database passwords must not be committed. Store them in GitLab
+under:
+
+```text
+Settings -> CI/CD -> Variables
+```
+
+Use protected and masked variables for production values. Keep local `.env`
+only on the machine or server where the service runs.
 
 ## Build and Migrate
 
