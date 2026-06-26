@@ -216,25 +216,26 @@ Current local result:
 Unit tests use fake clients and do not require DefectDojo, SMTP, or
 ManageEngine to be running.
 
-## GitLab CI/CD
+## GitHub Actions CI/CD
 
-The repository includes [.gitlab-ci.yml](.gitlab-ci.yml) with these stages:
+The repository includes [.github/workflows/ci.yml](.github/workflows/ci.yml)
+with these jobs:
 
-| Stage | Job | Purpose |
-|---|---|---|
-| `validate` | `secret_guard` | Fails if `.env`, private keys, credential JSON files, or common hardcoded token patterns are tracked |
-| `test` | `unit_tests` | Installs `requirements-dev.txt` and runs `pytest` |
-| `build` | `docker_build` | Builds the Docker image for branches and merge requests |
-| `build` | `docker_publish` | Publishes image tags to GitLab Container Registry for branch pipelines |
+| Job | Purpose |
+|---|---|
+| `secret-guard` | Fails if `.env`, private keys, credential JSON files, or common hardcoded token patterns are tracked |
+| `unit-tests` | Installs `requirements-dev.txt` and runs `pytest` |
+| `docker-build` | Builds the Docker image for branches and pull requests |
+| `docker-publish` | Publishes `latest` and commit-SHA image tags to GitHub Container Registry on `main` pushes |
 
-Initial GitLab setup:
+Initial GitHub setup:
 
-1. Create the GitLab project without initializing it with a README.
-2. Add your SSH public key in GitLab user settings.
-3. Point the local repository to GitLab:
+1. Create the GitHub repository without initializing it with a README.
+2. Add your SSH public key in GitHub account settings.
+3. Point the local repository to GitHub:
 
 ```bash
-git remote set-url origin git@gitlab.com:n21dcvt084/Devsecops_auto_ticket.git
+git remote set-url origin git@github.com:n21dcvt084-tech/Devsecops_auto_ticket.git
 git remote -v
 ```
 
@@ -253,20 +254,26 @@ git ls-files -- .env
 git push -u origin main
 ```
 
-The Docker jobs use Docker-in-Docker. In GitLab, the runner must allow
-privileged Docker service containers, or the build jobs will fail while
-connecting to the Docker daemon.
+The workflow uses GitHub-hosted runners and Docker Buildx. No custom runner is
+required for the default build and publish flow.
 
 Runtime secrets such as DefectDojo tokens, SMTP passwords, ManageEngine API
-tokens, and database passwords must not be committed. Store them in GitLab
-under:
+tokens, and database passwords must not be committed. Store deployment/runtime
+values in GitHub under:
 
 ```text
-Settings -> CI/CD -> Variables
+Settings -> Secrets and variables -> Actions
 ```
 
-Use protected and masked variables for production values. Keep local `.env`
+Use repository or environment secrets for production values. Keep local `.env`
 only on the machine or server where the service runs.
+
+Published images are stored in GitHub Container Registry:
+
+```text
+ghcr.io/n21dcvt084-tech/devsecops_auto_ticket:latest
+ghcr.io/n21dcvt084-tech/devsecops_auto_ticket:<commit-sha>
+```
 
 ## Build and Migrate
 
