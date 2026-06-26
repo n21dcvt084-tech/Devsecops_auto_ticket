@@ -542,7 +542,7 @@ The application container:
 - Enables `no-new-privileges`.
 - Includes an HTTP healthcheck.
 
-PostgreSQL port `5432` is bound to local host only.
+PostgreSQL container port `5432` is bound to local host port `5433`.
 
 For production, replace default database credentials, use a managed secret
 store, enable valid TLS certificates, and do not expose PostgreSQL publicly.
