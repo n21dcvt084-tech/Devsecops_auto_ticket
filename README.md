@@ -1,4 +1,4 @@
-# DevSecOps Auto Ticket v2
+# DevSecOps Auto Ticket 
 
 Backend service that polls active and verified findings from DefectDojo,
 prevents duplicate processing in PostgreSQL, and creates ManageEngine tickets.
